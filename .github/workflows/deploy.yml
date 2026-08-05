@@ -57,6 +57,6 @@ jobs:
               -p 127.0.0.1:8090:8090 \
               -e DEEPSEEK_API_KEY='${{ secrets.DEEPSEEK_API_KEY }}' \
               -e INTERNAL_SECRET='${{ secrets.AI_INTERNAL_SECRET }}' \
-              -e SPRING_BOOT_URL='http://edunexify-backend-container:8080' \
+              -e SPRING_BOOT_URL='http://localhost:8080' \
               -e REDIS_URL='${{ secrets.REDIS_URL }}' \
               edunexify-ai
