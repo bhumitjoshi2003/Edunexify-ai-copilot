@@ -19,6 +19,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies and verify imports
+        env:
+          DEEPSEEK_API_KEY: dummy-for-import-check
+          INTERNAL_SECRET: dummy-for-import-check
         run: |
           pip install -r requirements.txt
           python -c "import main"
