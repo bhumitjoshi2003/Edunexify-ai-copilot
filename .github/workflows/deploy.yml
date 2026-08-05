@@ -33,8 +33,13 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            cd ~/edunexify-ai
-            git fetch origin && git reset --hard origin/main
+            if [ -d ~/edunexify-ai/.git ]; then
+              cd ~/edunexify-ai
+              git fetch origin && git reset --hard origin/main
+            else
+              git clone https://github.com/bhumitjoshi2003/Edunexify-ai-copilot.git ~/edunexify-ai
+              cd ~/edunexify-ai
+            fi
 
             # Shared internal network with the backend container — lets this
             # service reach Spring Boot (and vice versa) by container name.
