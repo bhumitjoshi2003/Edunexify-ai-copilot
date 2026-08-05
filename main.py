@@ -11,7 +11,7 @@ from routers import chat
 
 app = FastAPI(
     title="Edunexify AI Service",
-    version="0.1.0",
+    version="0.1.1",
     # Disable the public /docs and /redoc pages in prod to avoid exposing internals.
     # Set docs_url="/docs" locally if you want the Swagger UI during development.
     docs_url="/docs",
