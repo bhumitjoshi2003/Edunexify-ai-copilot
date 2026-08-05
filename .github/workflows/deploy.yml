@@ -1,0 +1,62 @@
+name: Deploy AI Service to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies and verify imports
+        run: |
+          pip install -r requirements.txt
+          python -c "import main"
+
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd ~/edunexify-ai
+            git fetch origin && git reset --hard origin/main
+
+            # Shared internal network with the backend container — lets this
+            # service reach Spring Boot (and vice versa) by container name.
+            # Idempotent: whichever of the two deploy pipelines runs first creates it.
+            docker network create edunexify-net 2>/dev/null || true
+
+            docker stop edunexify-ai-container || true
+            docker rm -f edunexify-ai-container || true
+
+            docker build -t edunexify-ai .
+
+            docker run -d \
+              --restart unless-stopped \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              --health-cmd="python -c \"import urllib.request as u; u.urlopen('http://localhost:8090/health')\"" \
+              --health-interval=30s \
+              --health-timeout=5s \
+              --health-retries=3 \
+              --name edunexify-ai-container \
+              --network edunexify-net \
+              -p 127.0.0.1:8090:8090 \
+              -e DEEPSEEK_API_KEY='${{ secrets.DEEPSEEK_API_KEY }}' \
+              -e INTERNAL_SECRET='${{ secrets.AI_INTERNAL_SECRET }}' \
+              -e SPRING_BOOT_URL='http://edunexify-backend-container:8080' \
+              -e REDIS_URL='${{ secrets.REDIS_URL }}' \
+              edunexify-ai

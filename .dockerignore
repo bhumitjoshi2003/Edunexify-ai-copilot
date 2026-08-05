@@ -1,0 +1,10 @@
+.venv
+venv/
+__pycache__
+*.pyc
+.env
+.env.example
+.git
+.gitignore
+.claude
+edunexify-ai.postman_collection.json

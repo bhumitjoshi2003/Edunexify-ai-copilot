@@ -1,0 +1,109 @@
+{
+  "info": {
+    "name": "Edunexify AI Copilot",
+    "_postman_id": "b8e2f9a0-1c3d-4e5f-9a6b-edunexify-ai",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8090" },
+    { "key": "internalSecret", "value": "dev-secret-change-in-prod" }
+  ],
+  "item": [
+    {
+      "name": "Health check",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/health"
+      }
+    },
+    {
+      "name": "Chat - missing secret (expect 401)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": "{{baseUrl}}/chat",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"What is my attendance?\",\n  \"user\": {\n    \"userId\": \"1\",\n    \"role\": \"STUDENT\",\n    \"schoolId\": 1,\n    \"name\": \"Test Student\",\n    \"className\": \"10-A\"\n  },\n  \"accessToken\": \"fake-token\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Chat - student, year attendance",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Internal-Secret", "value": "{{internalSecret}}" }
+        ],
+        "url": "{{baseUrl}}/chat",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"What is my attendance this year?\",\n  \"user\": {\n    \"userId\": \"1\",\n    \"role\": \"STUDENT\",\n    \"schoolId\": 1,\n    \"name\": \"Test Student\",\n    \"className\": \"10-A\"\n  },\n  \"accessToken\": \"fake-token\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Chat - student, specific month",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Internal-Secret", "value": "{{internalSecret}}" }
+        ],
+        "url": "{{baseUrl}}/chat",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"How was my attendance in July 2026?\",\n  \"user\": {\n    \"userId\": \"1\",\n    \"role\": \"STUDENT\",\n    \"schoolId\": 1,\n    \"name\": \"Test Student\",\n    \"className\": \"10-A\"\n  },\n  \"accessToken\": \"fake-token\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Chat - teacher role (no class context)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Internal-Secret", "value": "{{internalSecret}}" }
+        ],
+        "url": "{{baseUrl}}/chat",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"What is my attendance?\",\n  \"user\": {\n    \"userId\": \"42\",\n    \"role\": \"TEACHER\",\n    \"schoolId\": 1,\n    \"name\": \"Test Teacher\"\n  },\n  \"accessToken\": \"fake-token\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Chat - unrelated message (no tool call expected)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Internal-Secret", "value": "{{internalSecret}}" }
+        ],
+        "url": "{{baseUrl}}/chat",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"Who are you and what can you help me with?\",\n  \"user\": {\n    \"userId\": \"1\",\n    \"role\": \"STUDENT\",\n    \"schoolId\": 1,\n    \"name\": \"Test Student\",\n    \"className\": \"10-A\"\n  },\n  \"accessToken\": \"fake-token\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Chat - malformed body (expect 422)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Internal-Secret", "value": "{{internalSecret}}" }
+        ],
+        "url": "{{baseUrl}}/chat",
+        "body": {
+          "mode": "raw",
+          "raw": "{}"
+        }
+      }
+    }
+  ]
+}
