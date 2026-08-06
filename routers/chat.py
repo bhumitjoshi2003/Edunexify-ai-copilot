@@ -22,6 +22,12 @@ from schemas.chat import ChatRequest, ChatResponse, UserContext
 from tools.attendance import get_attendance_summary, current_academic_session
 from tools.fees import get_fee_summary
 from tools.results import get_results_summary
+from tools.teacher_attendance import get_class_attendance_summary, get_low_attendance_students
+from tools.teacher_results import get_class_performance_summary
+from tools.admin_dashboard import get_school_overview, get_class_attendance_comparison
+from tools.admin_attendance import get_school_low_attendance_students
+from tools.admin_fees import get_fee_defaulters
+from tools.admin_results import get_school_performance_summary
 
 router = APIRouter()
 
@@ -37,7 +43,7 @@ _client = OpenAI(
 # The "parameters" field is standard JSON Schema — same content as Anthropic's
 # "input_schema", just a different wrapper key name.
 
-TOOLS: list[dict] = [
+STUDENT_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
@@ -131,22 +137,212 @@ TOOLS: list[dict] = [
     }
 ]
 
+# ─── Teacher tools ─────────────────────────────────────────────────────────────
+# className is NEVER a tool argument — every tool below scopes to user.className,
+# which Spring Boot resolved from the teacher's own classTeacher field (see
+# AiProxyController.resolveClassName). The underlying endpoints re-check this
+# server-side too, so there's no argument the model could pass to widen access.
 
-def _build_system_prompt(user: UserContext) -> str:
-    today = date.today().isoformat()
-    session = current_academic_session()
+TEACHER_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_class_attendance_summary",
+            "description": (
+                "Fetch an attendance overview for the teacher's own class: class average attendance, "
+                "how many students are below 75%, and the highest/lowest attending students. "
+                "Call this when the teacher asks how their class's attendance is doing overall. "
+                "Use type='year' for a full academic session. Use type='month' for one calendar month."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["year", "month"],
+                        "description": "Summary period. 'year' = full academic session. 'month' = single calendar month.",
+                    },
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Only used when type='year'. Defaults to the current session.",
+                    },
+                    "month": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 12,
+                        "description": "Calendar month (1–12). Required when type='month'.",
+                    },
+                    "year": {
+                        "type": "integer",
+                        "description": "Calendar year, e.g. 2026. Required when type='month'.",
+                    },
+                },
+                "required": ["type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_low_attendance_students",
+            "description": (
+                "List the specific students in the teacher's class whose attendance is below a threshold "
+                "(75% by default). Call this when the teacher asks which students have low attendance, "
+                "which students are missing too many days, or which students need attention on attendance."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "threshold": {
+                        "type": "number",
+                        "description": "Attendance percentage cutoff. Students below this are returned. Defaults to 75.",
+                    },
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Defaults to the current session.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_class_performance_summary",
+            "description": (
+                "Fetch exam performance for the teacher's own class: class average, top performers, "
+                "students needing attention, and per-subject class averages (which subjects students are "
+                "struggling with). Call this when the teacher asks how their class performed in an exam, "
+                "which students need academic attention, or which subjects students are weak in. "
+                "Defaults to the most recently created exam in the current session if no exam name is given."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Defaults to the current session.",
+                    },
+                    "examName": {
+                        "type": "string",
+                        "description": "Specific exam name to fetch (e.g. 'Mid Term', 'Final Exam'). If omitted, the latest exam is used.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+]
 
-    return f"""You are Edunexify AI Copilot — a helpful assistant embedded in the Edunexify school management platform.
+# ─── Admin tools ───────────────────────────────────────────────────────────────
+# None of these take a className/studentId argument that widens scope beyond
+# the caller's own school — every underlying endpoint derives schoolId from
+# the JWT server-side (SecurityUtil), same as every other tool in this file.
+# className here (get_fee_defaulters) narrows an already-school-scoped query,
+# it never crosses into another school.
 
-Logged-in user:
-- Name: {user.name or user.userId}
-- Role: {user.role}
-- Class: {user.className or "N/A"}
+ADMIN_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_school_overview",
+            "description": (
+                "Fetch a top-level school snapshot: total students, total teachers, fees collected "
+                "this month, count of overdue students, today's attendance rate, and pending leave requests. "
+                "Call this when the admin asks for an overall school summary or a general status check."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_class_attendance_comparison",
+            "description": (
+                "Fetch this month's attendance rate for every class in the school, for comparison. "
+                "Call this when the admin asks which classes have the best/worst attendance, or wants "
+                "a class-by-class attendance breakdown."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_school_low_attendance_students",
+            "description": (
+                "List individual students across the WHOLE school whose attendance is below a threshold "
+                "(75% by default), with their class. Call this when the admin asks which specific students "
+                "have low attendance or need attention on attendance, school-wide (not just one class)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "threshold": {
+                        "type": "number",
+                        "description": "Attendance percentage cutoff. Students below this are returned. Defaults to 75.",
+                    },
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Defaults to the current session.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_fee_defaulters",
+            "description": (
+                "Fetch students with pending/overdue fees: total count, total amount due, a class-wise "
+                "breakdown, and the most overdue students. Call this when the admin asks how many students "
+                "have pending fees, which students are fee defaulters, or wants fee collection insights."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Defaults to the current session.",
+                    },
+                    "className": {
+                        "type": "string",
+                        "description": "Restrict to one class, e.g. '10'. Omit for the whole school.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_school_performance_summary",
+            "description": (
+                "Fetch each class's performance in its own latest exam: school average, best/worst "
+                "performing class, a full class-by-class breakdown, and the weakest subjects school-wide. "
+                "Call this when the admin asks which class performed best/worst, wants an academic "
+                "performance summary, or asks which subjects students are struggling with school-wide."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Defaults to the current session.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+]
 
-Today's date: {today}
-Current academic session: {session}
 
-## Available tools
+_STUDENT_PROMPT_BODY = """## Available tools
 - get_fee_summary — use when the student asks about fees, pending payments, paid months, or outstanding amounts.
 - get_attendance_summary — use when the student asks about attendance, absences, or attendance percentage.
 - get_results_summary — use when the student asks about marks, exam results, scores, grades, rank, or performance.
@@ -188,6 +384,118 @@ Do NOT call any tool for:
 - Be concise and direct. Do NOT end responses with "Is there anything else you'd like to know?" or similar filler.
 - Use emojis sparingly — only where they add meaning, not as decoration. Never use a cheerful emoji (😊 😄) when reporting a problem like unpaid fees or low attendance."""
 
+_TEACHER_PROMPT_BODY = """## Available tools
+- get_class_attendance_summary — use when the teacher asks how their class's attendance is doing overall (averages, how many students are below 75%).
+- get_low_attendance_students — use when the teacher asks WHICH students have low/poor attendance, are missing too many days, or need attention on attendance.
+- get_class_performance_summary — use when the teacher asks how their class performed in an exam, which students need academic attention, or which subjects students are struggling with.
+
+All three tools are automatically scoped to the teacher's own assigned class — there is no className argument, so you never need to ask the teacher which class they mean.
+
+You may call multiple tools in a single turn if the user asks about more than one topic (e.g. "how's my class doing overall" could warrant both attendance and performance).
+
+## Tool usage rules
+Only call a tool when the teacher explicitly asks about their class's attendance or academic performance.
+Do NOT call any tool for:
+- Greetings or small talk ("hi", "hello", "how are you")
+- Questions about your identity or capabilities ("who are you", "what can you help me with")
+- General questions that do not require class data
+If the user asks something ambiguous like "which students need attention", consider calling both get_low_attendance_students and get_class_performance_summary unless context clearly points to just one (e.g. they already said "attendance" or "marks").
+
+## When showing class attendance data
+- Lead with the class average attendance percentage and how many students are below 75%.
+- Name the lowest-attendance students specifically when relevant, not just the count.
+- If the tool returns an "error" field (e.g. not a class teacher, access denied), relay that message plainly — do not guess at attendance numbers.
+
+## When showing low-attendance students
+- List each student by name with their attendance percentage, lowest first.
+- If studentsBelowThreshold is 0, say clearly that no students are below the threshold — that's good news, don't imply a problem exists.
+
+## When showing class performance data
+- Lead with the exam name and class average percentage.
+- Name the students in studentsNeedingAttention specifically, not just "some students".
+- List subjectPerformance from weakest to strongest — call out the weakest subject explicitly since that's usually the most actionable insight.
+- If noExamsYet is true, say clearly that no exams are configured yet — do NOT say "unable to fetch".
+- If the tool returns an "availableExams" list (exam name not found), tell the teacher which exam names actually exist instead of failing silently.
+
+## General behaviour
+- Never guess or fabricate numbers, student names, or subjects — only report what tools return.
+- If a tool returns an error or a "message" field (no data yet), relay that clearly.
+- When the user asks about multiple topics, call all relevant tools and present results in sections.
+- Be concise and direct. Do NOT end responses with "Is there anything else you'd like to know?" or similar filler.
+- Use emojis sparingly — only where they add meaning, not as decoration. Never use a cheerful emoji (😊 😄) when reporting a problem like low attendance or weak performance."""
+
+_ADMIN_PROMPT_BODY = """## Available tools
+- get_school_overview — use for an overall school summary or general status check (students, teachers, fees this month, overdue count, today's attendance, pending leaves).
+- get_class_attendance_comparison — use when the admin asks which classes have the best/worst attendance, or wants a class-by-class breakdown (this month).
+- get_school_low_attendance_students — use when the admin asks WHICH specific students (not just which classes) have low attendance, school-wide.
+- get_fee_defaulters — use when the admin asks about pending fees, how many students owe money, or fee defaulters.
+- get_school_performance_summary — use when the admin asks which class performed best/worst in its latest exam, wants an academic performance summary, or asks which subjects students are struggling with school-wide.
+
+For broad questions (e.g. "give me an overall school summary"), call multiple relevant tools in the same turn and present the results in sections — don't limit yourself to one.
+For ambiguous requests like "which students/classes need attention", consider calling get_school_low_attendance_students, get_fee_defaulters, and get_school_performance_summary together unless the phrasing clearly points to just one domain.
+
+## Tool usage rules
+Only call a tool when the admin explicitly asks about school data.
+Do NOT call any tool for:
+- Greetings or small talk ("hi", "hello", "how are you")
+- Questions about your identity or capabilities ("who are you", "what can you help me with")
+- General questions that do not require school data
+
+## When showing school overview data
+- Lead with student/teacher counts and today's attendance rate.
+- Call out overdue students and pending leaves as action items, not just numbers.
+
+## When showing class attendance comparison
+- Name the lowest and highest attendance classes specifically, with their percentages.
+- Mention this reflects the current calendar month only, not the full session, if the admin's question implied a longer period.
+
+## When showing low-attendance students
+- List students by name with their class and attendance percentage, lowest first.
+- If truncated is true, mention there are more below the threshold than shown (studentsBelowThreshold gives the real total).
+- If studentsBelowThreshold is 0, say clearly that's good news — don't imply a problem.
+
+## When showing fee defaulters
+- Lead with total defaulter count and total amount due.
+- Break down by class if byClass has more than one entry.
+- Name the most overdue students specifically from mostOverdue.
+
+## When showing school performance data
+- Name the best and worst performing class specifically, with their exam name and percentage — note if they're different exams.
+- List weakestSubjectsSchoolWide explicitly; that's usually the most actionable insight.
+- If noResultsYet is true, say clearly no exam results are available yet — do NOT say "unable to fetch".
+- classesWithNoExamYet > 0 means some classes were skipped because they have no exam configured yet — mention this if relevant rather than implying full school coverage.
+
+## General behaviour
+- Never guess or fabricate numbers, student names, class names, or subjects — only report what tools return.
+- If a tool returns an "error" field, relay that message plainly rather than guessing at data.
+- Be concise and direct. Do NOT end responses with "Is there anything else you'd like to know?" or similar filler.
+- Use emojis sparingly — only where they add meaning, not as decoration. Never use a cheerful emoji (😊 😄) when reporting a problem like overdue fees, low attendance, or weak performance."""
+
+_DEFAULT_PROMPT_BODY = """No specific data tools are available for your role yet. Answer general questions about Edunexify only — do not claim to fetch live data."""
+
+
+def _build_system_prompt(user: UserContext) -> str:
+    today = date.today().isoformat()
+    session = current_academic_session()
+
+    body = {
+        "STUDENT": _STUDENT_PROMPT_BODY,
+        "TEACHER": _TEACHER_PROMPT_BODY,
+        "ADMIN": _ADMIN_PROMPT_BODY,
+    }.get(user.role, _DEFAULT_PROMPT_BODY)
+
+    return f"""You are Edunexify AI Copilot — a helpful assistant embedded in the Edunexify school management platform.
+
+Logged-in user:
+- Name: {user.name or user.userId}
+- Role: {user.role}
+- Class: {user.className or "N/A"}
+
+Today's date: {today}
+Current academic session: {session}
+
+{body}"""
+
 
 async def _execute_tool(
     tool_name: str,
@@ -220,6 +528,61 @@ async def _execute_tool(
             session=tool_input.get("session"),
         )
 
+    if tool_name == "get_class_attendance_summary":
+        return await get_class_attendance_summary(
+            user=user,
+            access_token=access_token,
+            type=tool_input["type"],
+            session=tool_input.get("session"),
+            month=tool_input.get("month"),
+            year=tool_input.get("year"),
+        )
+
+    if tool_name == "get_low_attendance_students":
+        return await get_low_attendance_students(
+            user=user,
+            access_token=access_token,
+            threshold=tool_input.get("threshold", 75.0),
+            session=tool_input.get("session"),
+        )
+
+    if tool_name == "get_class_performance_summary":
+        return await get_class_performance_summary(
+            user=user,
+            access_token=access_token,
+            session=tool_input.get("session"),
+            examName=tool_input.get("examName"),
+        )
+
+    if tool_name == "get_school_overview":
+        return await get_school_overview(user=user, access_token=access_token)
+
+    if tool_name == "get_class_attendance_comparison":
+        return await get_class_attendance_comparison(user=user, access_token=access_token)
+
+    if tool_name == "get_school_low_attendance_students":
+        return await get_school_low_attendance_students(
+            user=user,
+            access_token=access_token,
+            threshold=tool_input.get("threshold", 75.0),
+            session=tool_input.get("session"),
+        )
+
+    if tool_name == "get_fee_defaulters":
+        return await get_fee_defaulters(
+            user=user,
+            access_token=access_token,
+            session=tool_input.get("session"),
+            className=tool_input.get("className"),
+        )
+
+    if tool_name == "get_school_performance_summary":
+        return await get_school_performance_summary(
+            user=user,
+            access_token=access_token,
+            session=tool_input.get("session"),
+        )
+
     return {"error": f"Unknown tool '{tool_name}'."}
 
 
@@ -247,16 +610,25 @@ async def chat(
         {"role": "user", "content": request.message},
     ]
 
+    # Only offer the tools relevant to this role — DeepSeek can't call a tool
+    # it was never given, so this is the first line of scoping (Spring Boot's
+    # own per-endpoint checks are what actually enforce it, see tools/*.py).
+    role_tools = {
+        "STUDENT": STUDENT_TOOLS,
+        "TEACHER": TEACHER_TOOLS,
+        "ADMIN": ADMIN_TOOLS,
+    }.get(request.user.role, [])
+
     # ─── Tool-calling loop ────────────────────────────────────────────────────
     reply_text: str | None = None
     try:
         for _ in range(5):  # Safety cap — prevents infinite loops
-            response = _client.chat.completions.create(
-                model="deepseek-chat",
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-            )
+            completion_kwargs: dict = {"model": "deepseek-chat", "messages": messages}
+            if role_tools:
+                completion_kwargs["tools"] = role_tools
+                completion_kwargs["tool_choice"] = "auto"
+
+            response = _client.chat.completions.create(**completion_kwargs)
 
             choice = response.choices[0]
 
