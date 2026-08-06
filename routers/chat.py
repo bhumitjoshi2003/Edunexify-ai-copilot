@@ -11,10 +11,12 @@ Tools are defined as {"type": "function", "function": {"name", "description", "p
 and tool results are returned as {"role": "tool", "tool_call_id": ..., "content": ...}.
 """
 import json
+from collections.abc import AsyncGenerator
 from datetime import date
 
 from fastapi import APIRouter, Header, HTTPException
-from openai import OpenAI, APIStatusError
+from fastapi.responses import StreamingResponse
+from openai import APIStatusError, AsyncOpenAI, OpenAI
 
 import memory
 from config import settings
@@ -37,6 +39,21 @@ _client = OpenAI(
     api_key=settings.deepseek_api_key,
     base_url="https://api.deepseek.com",
 )
+
+# Async client for /chat/stream only. Streaming with the sync client would mean
+# `for chunk in stream:` blocks the event loop for the whole response — fine for
+# a single request, bad for a server handling concurrent chats. AsyncOpenAI's
+# `async for` yields control back between chunks like everything else here.
+_async_client = AsyncOpenAI(
+    api_key=settings.deepseek_api_key,
+    base_url="https://api.deepseek.com",
+)
+
+# Streamed content is held back until it exceeds this length with no tool call
+# having started yet — see _stream_chat_response. Comfortably longer than a
+# short "let me check that" preamble (observed at 40-55 chars in testing) so a
+# real preamble never accidentally crosses it and leaks before a tool call.
+_STREAM_HOLD_BACK_CHARS = 120
 
 # ─── Tool definitions (OpenAI format) ─────────────────────────────────────────
 # OpenAI wraps each tool in {"type": "function", "function": {...}}.
@@ -567,6 +584,14 @@ Logged-in user:
 Today's date: {today}
 Current academic session: {session}
 
+## Responses are streamed live to the user
+Your replies are streamed to the chat bubble as you generate them — the user sees text appear as you write it.
+When you decide to call a tool, call it directly with NO preceding text — do not write "Let me check that",
+"I'll look that up", "One moment", or any other narration before or instead of a tool call. Any text you produce
+in the same turn as a tool call is shown to the user immediately and cannot be taken back, so only ever produce
+text there if it's part of your genuine final answer. Write your actual response only in the turn after your
+tool results come back, once you have real data to report.
+
 {body}"""
 
 
@@ -770,3 +795,170 @@ async def chat(
     )
 
     return ChatResponse(reply=reply_text)
+
+
+# ─── Streaming endpoint ─────────────────────────────────────────────────────
+# Same orchestration as /chat (same system prompt, same role-scoped tools, same
+# _execute_tool dispatch, same memory contract) — the only difference is HOW the
+# final answer reaches the caller. Every call in the loop below is made with
+# stream=True. A turn where the model wants to call a tool produces no (or
+# empty) content deltas — DeepSeek only emits real text once it's done calling
+# tools — so simply forwarding content deltas as they arrive naturally streams
+# ONLY the final user-facing answer; tool-calling turns stay entirely internal
+# without any special-casing. Tool-call deltas (name/arguments fragments) are
+# accumulated but never written to the response stream.
+
+
+async def _stream_chat_response(request: ChatRequest) -> AsyncGenerator[str, None]:
+    history = await memory.get_history(
+        request.user.schoolId, request.user.userId, request.conversationId
+    )
+
+    messages: list[dict] = [
+        {"role": "system", "content": _build_system_prompt(request.user)},
+        *history,
+        {"role": "user", "content": request.message},
+    ]
+
+    role_tools = {
+        "STUDENT": STUDENT_TOOLS,
+        "TEACHER": TEACHER_TOOLS,
+        "ADMIN": ADMIN_TOOLS,
+    }.get(request.user.role, [])
+
+    full_reply = ""
+    errored = False
+
+    try:
+        for _ in range(5):  # Safety cap — prevents infinite loops, same as /chat
+            completion_kwargs: dict = {"model": "deepseek-chat", "messages": messages, "stream": True}
+            if role_tools:
+                completion_kwargs["tools"] = role_tools
+                completion_kwargs["tool_choice"] = "auto"
+
+            stream = await _async_client.chat.completions.create(**completion_kwargs)
+
+            turn_content = ""       # everything produced this turn, for context reconstruction below
+            held_back = ""          # content not yet released to the client
+            committed = False       # True once we've decided this turn is safe to stream live
+            saw_tool_call = False
+            # index -> accumulated {id, name, arguments} fragments for this turn's tool call(s)
+            tool_calls_acc: dict[int, dict] = {}
+            finish_reason: str | None = None
+
+            async for chunk in stream:
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+                delta = choice.delta
+
+                if delta.tool_calls:
+                    saw_tool_call = True
+                    for tc_delta in delta.tool_calls:
+                        entry = tool_calls_acc.setdefault(tc_delta.index, {"id": None, "name": "", "arguments": ""})
+                        if tc_delta.id:
+                            entry["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                entry["name"] += tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                entry["arguments"] += tc_delta.function.arguments
+
+                if delta.content:
+                    turn_content += delta.content
+
+                    if saw_tool_call:
+                        # A tool call already started this turn — the prompt asks the model not to
+                        # narrate before calling a tool, but it isn't always obeyed (observed in
+                        # testing), and bytes already sent over HTTP can't be recalled. So: hold back
+                        # by default (below) and only ever release content once we're confident no
+                        # tool call is coming. Once one HAS arrived, anything further is discarded too.
+                        continue
+
+                    if committed:
+                        full_reply += delta.content
+                        yield delta.content
+                    else:
+                        held_back += delta.content
+                        # Past a short preamble's length with still no tool call in sight — safe to
+                        # start streaming live from here. Flushes the held-back text as one small
+                        # catch-up burst, then every following chunk streams individually.
+                        if len(held_back) > _STREAM_HOLD_BACK_CHARS:
+                            committed = True
+                            full_reply += held_back
+                            yield held_back
+                            held_back = ""
+
+            if not saw_tool_call and held_back:
+                # Turn ended (short final answer) without ever crossing the threshold — flush the rest.
+                full_reply += held_back
+                yield held_back
+
+            if finish_reason == "tool_calls":
+                ordered_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+                messages.append({
+                    "role": "assistant",
+                    "content": turn_content or None,
+                    "tool_calls": [
+                        {
+                            "id": c["id"],
+                            "type": "function",
+                            "function": {"name": c["name"], "arguments": c["arguments"]},
+                        }
+                        for c in ordered_calls
+                    ],
+                })
+
+                for c in ordered_calls:
+                    tool_input = json.loads(c["arguments"]) if c["arguments"] else {}
+                    tool_output = await _execute_tool(c["name"], tool_input, request.user, request.accessToken)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": c["id"],
+                        "content": json.dumps(tool_output),
+                    })
+                continue  # next iteration streams the follow-up turn
+
+            break  # finish_reason == "stop" (or unexpected) — done
+
+    except APIStatusError as e:
+        errored = True
+        if e.status_code == 402 or e.status_code == 429:
+            msg = "\n\n⚠️ AI Copilot is temporarily unavailable. Please try again later."
+        else:
+            msg = f"\n\n⚠️ AI provider error ({e.status_code}). Please try again."
+        full_reply += msg
+        yield msg
+    except Exception as e:
+        errored = True
+        msg = "\n\n⚠️ AI Copilot is temporarily unavailable. Please try again later."
+        full_reply += msg
+        yield msg
+
+    if not full_reply:
+        full_reply = "I wasn't able to complete your request. Please try again."
+        yield full_reply
+
+    # Only persist a clean, complete reply — never a partial/errored one, so a
+    # broken turn doesn't pollute the next turn's memory with a garbled reply.
+    if not errored:
+        await memory.append_turn(
+            request.user.schoolId,
+            request.user.userId,
+            request.conversationId,
+            history,
+            request.message,
+            full_reply,
+        )
+
+
+@router.post("/chat/stream")
+async def chat_stream(
+    request: ChatRequest,
+    x_internal_secret: str = Header(alias="X-Internal-Secret"),
+) -> StreamingResponse:
+    if x_internal_secret != settings.internal_secret:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    return StreamingResponse(_stream_chat_response(request), media_type="text/plain; charset=utf-8")
