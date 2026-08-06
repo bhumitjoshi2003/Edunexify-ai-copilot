@@ -1,29 +1,32 @@
 """
-tools/admin_results.py — School-wide exam performance tool for the ADMIN role.
+tools/admin_results.py — Exam performance tools for the ADMIN role.
 
-Composes three existing endpoints, none of them new:
-  1. GET /api/dashboard/class-stats                              -> the school's class list
-  2. GET /api/exams?session=&className=                          -> that class's exams
-  3. GET /api/marks/class/{className}/exam/{examConfigId}        -> per-student, per-subject marks
+Both tools are thin wrappers around consolidated Spring Boot endpoints
+(MarkService.computeClassExamPerformance / getSchoolPerformanceSummary):
 
-MarkController's class-results endpoint only restricts TEACHER callers to
-their own classTeacher assignment (checkTeacherClassAccess returns null,
-i.e. "allowed", for any non-TEACHER role) — so ADMIN can already fetch any
-class's results, same as it can already fetch any class's attendance.
+  GET /api/marks/class/{className}/exam-performance?session=&examName=
+    -> ClassExamPerformanceDTO: class average, ranked student list
+       (top/lowest scorer = first/last entry), subject averages, and
+       studentsWithNoMarksEntered — resolved and aggregated server-side in
+       one call instead of the old client-side "list exams, pick one, fetch
+       results, aggregate" round trip.
 
-Each class may be on a different "latest exam" (a Class 10 final exam and a
-Class 5 unit test aren't the same event) — we resolve "latest" per class
-independently, the same highest-id convention tools/teacher_results.py uses,
-and surface each class's examName alongside its score so that's visible
-rather than silently assumed to be the same exam school-wide.
+  GET /api/marks/school/performance-summary?session=
+    -> SchoolPerformanceSummaryDTO: every active class's own latest exam,
+       already aggregated, plus classesWithNoExamConfigured and
+       classesWithExamButNoMarksEntered kept separate (collapsing them would
+       hide whether a class was skipped because nothing's set up yet or
+       because it's set up but ungraded).
 
-Fetches for different classes run concurrently (each class's own two calls
-are inherently sequential — you need the examConfigId before you can fetch
-results) to keep latency reasonable for schools with many classes.
+Both endpoints exclude students with no mark entered from rankings/averages
+server-side (rank == 0 in the underlying data) rather than counting them as
+having scored 0% — that distinction used to get lost when this aggregation
+happened in Python from raw per-student rows.
+
+get_school_performance_summary still builds a school-wide top/bottom
+performer list here, since that's a cross-class view specific to what the
+LLM needs and isn't something a single class-scoped DTO would return.
 """
-import asyncio
-from collections import defaultdict
-
 import httpx
 
 from config import settings
@@ -31,50 +34,56 @@ from schemas.chat import UserContext
 from tools.attendance import current_academic_session
 
 
-async def _class_latest_exam_performance(
-    client: httpx.AsyncClient, class_name: str, session: str, cookies: dict
-) -> dict | None:
-    exams_resp = await client.get(
-        f"{settings.spring_boot_url}/api/exams",
-        params={"session": session, "className": class_name},
-        cookies=cookies,
-        timeout=10.0,
-    )
-    if exams_resp.status_code != 200:
-        return None
-    exams: list[dict] = exams_resp.json()
-    if not exams:
-        return None
+async def get_class_exam_results(
+    user: UserContext,
+    access_token: str,
+    className: str,
+    session: str | None = None,
+    examName: str | None = None,
+) -> dict:
+    """Per-student breakdown for one named class's exam — top/lowest scorer, full ranked list."""
+    resolved_session = session or current_academic_session()
 
-    latest = max(exams, key=lambda e: e["id"])
+    params: dict = {"session": resolved_session}
+    if examName:
+        params["examName"] = examName
 
-    results_resp = await client.get(
-        f"{settings.spring_boot_url}/api/marks/class/{class_name}/exam/{latest['id']}",
-        cookies=cookies,
-        timeout=10.0,
-    )
-    if results_resp.status_code != 200:
-        return None
-    results: list[dict] = results_resp.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{settings.spring_boot_url}/api/marks/class/{className}/exam-performance",
+            params=params,
+            cookies={"accessToken": access_token},
+            timeout=10.0,
+        )
 
-    scored = [r for r in results if r.get("percentage") is not None]
-    if not scored:
-        return None
+    if response.status_code == 403:
+        return {"error": f"Access denied for class {className}."}
+    if response.status_code != 200:
+        return {"error": f"Spring Boot returned {response.status_code}: {response.text}"}
 
-    subject_scores: dict[str, list[float]] = defaultdict(list)
-    for r in results:
-        for s in r.get("subjects") or []:
-            obtained = s.get("marksObtained")
-            max_marks = s.get("maxMarks")
-            if obtained is not None and max_marks:
-                subject_scores[s["subjectName"]].append(obtained / max_marks * 100)
+    data: dict = response.json()
+    if data.get("noExamsYet") or "error" in data:
+        return data  # already shaped: {noExamsYet, message} or {error, availableExams}
+
+    ranked: list[dict] = data.get("studentsRanked") or []
 
     return {
-        "className": class_name,
-        "examName": latest.get("examName"),
-        "classAveragePercentage": round(sum(r["percentage"] for r in scored) / len(scored), 1),
-        "studentCount": len(scored),
-        "subjectAverages": {name: round(sum(v) / len(v), 1) for name, v in subject_scores.items()},
+        "className": data.get("className", className),
+        "session": resolved_session,
+        "examName": data.get("examName"),
+        "studentsWithMarksEntered": len(ranked),
+        "studentsWithNoMarksEntered": data.get("studentsWithNoMarksEntered") or [],
+        "classAveragePercentage": data.get("classAveragePercentage"),
+        "topScorer": ranked[0] if ranked else None,
+        "lowestScorer": ranked[-1] if ranked else None,
+        "allStudentsRanked": ranked,
+        "subjectPerformance": sorted(
+            (
+                {"subject": name, "classAveragePercentage": pct}
+                for name, pct in (data.get("subjectAverages") or {}).items()
+            ),
+            key=lambda x: x["classAveragePercentage"],
+        ),
     }
 
 
@@ -84,41 +93,40 @@ async def get_school_performance_summary(
     session: str | None = None,
 ) -> dict:
     resolved_session = session or current_academic_session()
-    cookies = {"accessToken": access_token}
 
     async with httpx.AsyncClient() as client:
-        class_stats_resp = await client.get(
-            f"{settings.spring_boot_url}/api/dashboard/class-stats",
-            cookies=cookies,
-            timeout=10.0,
-        )
-        if class_stats_resp.status_code != 200:
-            return {"error": f"Spring Boot returned {class_stats_resp.status_code}: {class_stats_resp.text}"}
-
-        class_names = [c["className"] for c in class_stats_resp.json()]
-        if not class_names:
-            return {"message": "No classes with active students found."}
-
-        per_class = await asyncio.gather(
-            *[_class_latest_exam_performance(client, c, resolved_session, cookies) for c in class_names]
+        response = await client.get(
+            f"{settings.spring_boot_url}/api/marks/school/performance-summary",
+            params={"session": resolved_session},
+            cookies={"accessToken": access_token},
+            timeout=15.0,
         )
 
-    per_class = [c for c in per_class if c is not None]
-    if not per_class:
+    if response.status_code == 403:
+        return {"error": "Access denied. School performance data is only available to admins."}
+    if response.status_code != 200:
+        return {"error": f"Spring Boot returned {response.status_code}: {response.text}"}
+
+    data: dict = response.json()
+    class_results: list[dict] = data.get("classResults") or []
+
+    if not class_results:
         return {
             "session": resolved_session,
             "noResultsYet": True,
             "message": f"No exam results are available yet for any class in session {resolved_session}.",
+            "classesWithNoExamConfigured": data.get("classesWithNoExamConfigured") or [],
+            "classesWithExamButNoMarksEntered": data.get("classesWithExamButNoMarksEntered") or [],
         }
 
-    by_avg_asc = sorted(per_class, key=lambda c: c["classAveragePercentage"])
+    by_avg_asc = sorted(class_results, key=lambda c: c["classAveragePercentage"])
 
     # School-wide subject averages: average each class's subject average (not
     # every student), so a large class doesn't drown out a small one's signal.
-    subject_scores_all: dict[str, list[float]] = defaultdict(list)
-    for c in per_class:
-        for subject, avg in c["subjectAverages"].items():
-            subject_scores_all[subject].append(avg)
+    subject_scores_all: dict[str, list[float]] = {}
+    for c in class_results:
+        for subject, avg in (c.get("subjectAverages") or {}).items():
+            subject_scores_all.setdefault(subject, []).append(avg)
 
     subject_school_wide = sorted(
         (
@@ -128,11 +136,25 @@ async def get_school_performance_summary(
         key=lambda x: x["schoolAveragePercentage"],
     )
 
+    # School-wide student leaderboard, built from the same per-class ranked
+    # lists above. Percentages are compared across different exams per class,
+    # so this is an approximation, not a single ranked exam — the "note"
+    # field says so explicitly for the LLM to relay.
+    all_students = [
+        {"studentName": s["studentName"], "percentage": s["percentage"], "className": c["className"]}
+        for c in class_results
+        for s in (c.get("studentsRanked") or [])
+    ]
+    by_student_pct_desc = sorted(all_students, key=lambda s: s["percentage"], reverse=True)
+
     return {
         "session": resolved_session,
-        "classesEvaluated": len(per_class),
-        "classesWithNoExamYet": len(class_names) - len(per_class),
-        "schoolAveragePercentage": round(sum(c["classAveragePercentage"] for c in per_class) / len(per_class), 1),
+        "classesEvaluated": len(class_results),
+        "classesWithNoExamConfigured": data.get("classesWithNoExamConfigured") or [],
+        "classesWithExamButNoMarksEntered": data.get("classesWithExamButNoMarksEntered") or [],
+        "schoolAveragePercentage": round(
+            sum(c["classAveragePercentage"] for c in class_results) / len(class_results), 1
+        ),
         "bestPerformingClass": {
             "className": by_avg_asc[-1]["className"],
             "examName": by_avg_asc[-1]["examName"],
@@ -148,4 +170,7 @@ async def get_school_performance_summary(
             for c in by_avg_asc
         ],
         "weakestSubjectsSchoolWide": subject_school_wide[:5],
+        "schoolWideTopPerformers": by_student_pct_desc[:5],
+        "schoolWideNeedingAttention": by_student_pct_desc[-5:][::-1],
+        "note": "Top/bottom performers compare each class's own latest exam — classes may be on different exams, so this is an approximation, not one single ranked test.",
     }

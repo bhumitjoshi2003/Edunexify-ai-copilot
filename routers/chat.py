@@ -27,7 +27,7 @@ from tools.teacher_results import get_class_performance_summary
 from tools.admin_dashboard import get_school_overview, get_class_attendance_comparison
 from tools.admin_attendance import get_school_low_attendance_students
 from tools.admin_fees import get_fee_defaulters
-from tools.admin_results import get_school_performance_summary
+from tools.admin_results import get_school_performance_summary, get_class_exam_results
 
 router = APIRouter()
 
@@ -260,11 +260,30 @@ ADMIN_TOOLS: list[dict] = [
         "function": {
             "name": "get_class_attendance_comparison",
             "description": (
-                "Fetch this month's attendance rate for every class in the school, for comparison. "
+                "Fetch and compare attendance rate across every class in the school. "
                 "Call this when the admin asks which classes have the best/worst attendance, or wants "
-                "a class-by-class attendance breakdown."
+                "a class-by-class attendance breakdown. "
+                "Use type='year' (the default) for the full academic session — use this unless the admin "
+                "specifically says 'this month'. Use type='month' ONLY when they explicitly ask about the "
+                "current calendar month specifically; that mode can report 0% for every class if attendance "
+                "simply hasn't been marked yet this month, which is NOT the same as a real 0% attendance rate — "
+                "the tool flags this explicitly when it happens, do not report it as poor attendance."
             ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["year", "month"],
+                        "description": "'year' = full academic session (default, use this for general questions). 'month' = current calendar month only.",
+                    },
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Only used when type='year'. Defaults to the current session.",
+                    },
+                },
+                "required": [],
+            },
         },
     },
     {
@@ -323,9 +342,15 @@ ADMIN_TOOLS: list[dict] = [
             "name": "get_school_performance_summary",
             "description": (
                 "Fetch each class's performance in its own latest exam: school average, best/worst "
-                "performing class, a full class-by-class breakdown, and the weakest subjects school-wide. "
+                "performing class, a full class-by-class breakdown, weakest subjects school-wide, AND a "
+                "school-wide top 5 / bottom 5 individual student leaderboard (schoolWideTopPerformers / "
+                "schoolWideNeedingAttention) built from those same per-student results. "
                 "Call this when the admin asks which class performed best/worst, wants an academic "
-                "performance summary, or asks which subjects students are struggling with school-wide."
+                "performance summary, asks which subjects students are struggling with school-wide, OR asks "
+                "which STUDENT is weakest/strongest academically WITHOUT naming a specific class. "
+                "If the admin names a specific class (e.g. 'who scored lowest in Class 2's exam'), use "
+                "get_class_exam_results instead — that gives the full ranked list for that one class, this "
+                "tool only gives the top/bottom 5 across the whole school."
             ),
             "parameters": {
                 "type": "object",
@@ -336,6 +361,37 @@ ADMIN_TOOLS: list[dict] = [
                     },
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_class_exam_results",
+            "description": (
+                "Fetch the FULL per-student ranked results for one named class's exam: top scorer, lowest "
+                "scorer, every student's percentage and rank, and subject averages for that class. "
+                "This is the ONLY tool that can answer 'who scored lowest/highest in class X's exam' — "
+                "no other tool returns an individual student's exam score. Requires className. "
+                "Defaults to that class's most recently created exam if examName is omitted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "className": {
+                        "type": "string",
+                        "description": "The class to fetch results for, e.g. '10' or 'Class 2'. Required.",
+                    },
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Defaults to the current session.",
+                    },
+                    "examName": {
+                        "type": "string",
+                        "description": "Specific exam name (e.g. 'Final Year Exam'). If omitted, the latest exam for that class is used.",
+                    },
+                },
+                "required": ["className"],
             },
         },
     },
@@ -379,6 +435,7 @@ Do NOT call any tool for:
 
 ## General behaviour
 - Never guess or fabricate numbers — only report what tools return.
+- Only use numbers from a tool call made THIS turn — never reuse or repurpose a number mentioned in an earlier reply for a new, different question (e.g. an attendance percentage is not an exam score). Call the relevant tool again if you need current data.
 - If a tool returns an error or a "message" field (no data yet), relay that clearly.
 - When the user asks about multiple topics, call all relevant tools and present results in sections.
 - Be concise and direct. Do NOT end responses with "Is there anything else you'd like to know?" or similar filler.
@@ -419,6 +476,7 @@ If the user asks something ambiguous like "which students need attention", consi
 
 ## General behaviour
 - Never guess or fabricate numbers, student names, or subjects — only report what tools return.
+- Only use numbers from a tool call made THIS turn — never reuse or repurpose a number mentioned in an earlier reply for a new, different question (e.g. an attendance percentage is not an exam score). Call the relevant tool again if you need current data.
 - If a tool returns an error or a "message" field (no data yet), relay that clearly.
 - When the user asks about multiple topics, call all relevant tools and present results in sections.
 - Be concise and direct. Do NOT end responses with "Is there anything else you'd like to know?" or similar filler.
@@ -426,10 +484,11 @@ If the user asks something ambiguous like "which students need attention", consi
 
 _ADMIN_PROMPT_BODY = """## Available tools
 - get_school_overview — use for an overall school summary or general status check (students, teachers, fees this month, overdue count, today's attendance, pending leaves).
-- get_class_attendance_comparison — use when the admin asks which classes have the best/worst attendance, or wants a class-by-class breakdown (this month).
-- get_school_low_attendance_students — use when the admin asks WHICH specific students (not just which classes) have low attendance, school-wide.
+- get_class_attendance_comparison — use when the admin asks which classes have the best/worst attendance, or wants a class-by-class breakdown. Defaults to the full session; only pass type='month' if they explicitly say "this month".
+- get_school_low_attendance_students — use when the admin asks WHICH specific students (not just which classes) have low attendance, school-wide. Returns attendance PERCENTAGES only — never exam data.
 - get_fee_defaulters — use when the admin asks about pending fees, how many students owe money, or fee defaulters.
-- get_school_performance_summary — use when the admin asks which class performed best/worst in its latest exam, wants an academic performance summary, or asks which subjects students are struggling with school-wide.
+- get_school_performance_summary — use for class-level exam performance (best/worst class, weakest subjects) AND for "which student is weakest/strongest academically" when no specific class is named (see schoolWideTopPerformers / schoolWideNeedingAttention).
+- get_class_exam_results — the ONLY tool with individual exam scores for a named class (top scorer, lowest scorer, full ranked list). Use whenever the admin names a specific class and asks about individual student performance in it (e.g. "who scored lowest in Class 2's exam").
 
 For broad questions (e.g. "give me an overall school summary"), call multiple relevant tools in the same turn and present the results in sections — don't limit yourself to one.
 For ambiguous requests like "which students/classes need attention", consider calling get_school_low_attendance_students, get_fee_defaulters, and get_school_performance_summary together unless the phrasing clearly points to just one domain.
@@ -441,13 +500,33 @@ Do NOT call any tool for:
 - Questions about your identity or capabilities ("who are you", "what can you help me with")
 - General questions that do not require school data
 
+## CRITICAL — do not confuse metrics or reuse old numbers
+These are DIFFERENT metrics from DIFFERENT tools — never substitute one for another, even when the numbers look plausible:
+- Attendance percentage (get_school_low_attendance_students, get_class_attendance_comparison) is NOT an exam score. A student flagged for low attendance did not "score" that percentage on any exam.
+- If asked about an individual student's exam score, rank, or academic standing, you MUST call get_class_exam_results (if a class is named) or use get_school_performance_summary's schoolWideTopPerformers/schoolWideNeedingAttention (if not). There is no other legitimate source for this.
+- Only use numbers that came from a tool call made THIS turn (or earlier in the same turn's tool-calling loop). Never reuse or repurpose a number mentioned in an earlier reply in the conversation history to answer a new, different question — call the relevant tool again instead.
+- If no available tool can answer what's being asked, say so plainly. Do not estimate, infer, or present a guess as if it were fetched data.
+
 ## When showing school overview data
 - Lead with student/teacher counts and today's attendance rate.
 - Call out overdue students and pending leaves as action items, not just numbers.
 
 ## When showing class attendance comparison
 - Name the lowest and highest attendance classes specifically, with their percentages.
-- Mention this reflects the current calendar month only, not the full session, if the admin's question implied a longer period.
+- State the period the data covers (the tool's "period" field) — full session by default, or "current calendar month" if type='month' was used.
+- If classesWithNoAttendanceRecordedYet is non-empty, say clearly that those classes have no attendance marked yet for that period — do NOT report them as having 0% attendance, that's a different thing.
+
+## When showing individual class exam results (get_class_exam_results)
+- State topScorer and lowestScorer by name and percentage — these come directly from the tool, do not calculate or guess them yourself.
+- Mention studentsWithNoMarksEntered if non-empty, so the admin knows those students aren't reflected in the ranking yet.
+- List subjectPerformance from weakest to strongest for that class.
+
+## When showing school performance data (get_school_performance_summary)
+- Name the best and worst performing class specifically, with their exam name and percentage — note if they're different exams.
+- List weakestSubjectsSchoolWide explicitly; that's usually the most actionable insight.
+- When asked which student is weakest/strongest school-wide, use schoolWideTopPerformers / schoolWideNeedingAttention and relay the tool's "note" field (different classes may be on different exams, so this is an approximation).
+- If noResultsYet is true, say clearly no exam results are available yet — do NOT say "unable to fetch".
+- classesWithNoExamYet > 0 means some classes were skipped because they have no exam configured yet — mention this if relevant rather than implying full school coverage.
 
 ## When showing low-attendance students
 - List students by name with their class and attendance percentage, lowest first.
@@ -458,12 +537,6 @@ Do NOT call any tool for:
 - Lead with total defaulter count and total amount due.
 - Break down by class if byClass has more than one entry.
 - Name the most overdue students specifically from mostOverdue.
-
-## When showing school performance data
-- Name the best and worst performing class specifically, with their exam name and percentage — note if they're different exams.
-- List weakestSubjectsSchoolWide explicitly; that's usually the most actionable insight.
-- If noResultsYet is true, say clearly no exam results are available yet — do NOT say "unable to fetch".
-- classesWithNoExamYet > 0 means some classes were skipped because they have no exam configured yet — mention this if relevant rather than implying full school coverage.
 
 ## General behaviour
 - Never guess or fabricate numbers, student names, class names, or subjects — only report what tools return.
@@ -558,7 +631,12 @@ async def _execute_tool(
         return await get_school_overview(user=user, access_token=access_token)
 
     if tool_name == "get_class_attendance_comparison":
-        return await get_class_attendance_comparison(user=user, access_token=access_token)
+        return await get_class_attendance_comparison(
+            user=user,
+            access_token=access_token,
+            type=tool_input.get("type", "year"),
+            session=tool_input.get("session"),
+        )
 
     if tool_name == "get_school_low_attendance_students":
         return await get_school_low_attendance_students(
@@ -581,6 +659,15 @@ async def _execute_tool(
             user=user,
             access_token=access_token,
             session=tool_input.get("session"),
+        )
+
+    if tool_name == "get_class_exam_results":
+        return await get_class_exam_results(
+            user=user,
+            access_token=access_token,
+            className=tool_input["className"],
+            session=tool_input.get("session"),
+            examName=tool_input.get("examName"),
         )
 
     return {"error": f"Unknown tool '{tool_name}'."}
