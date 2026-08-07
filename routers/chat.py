@@ -14,7 +14,7 @@ import json
 from collections.abc import AsyncGenerator
 from datetime import date
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from openai import APIStatusError, AsyncOpenAI, OpenAI
 
@@ -30,6 +30,7 @@ from tools.admin_dashboard import get_school_overview, get_class_attendance_comp
 from tools.admin_attendance import get_school_low_attendance_students
 from tools.admin_fees import get_fee_defaulters
 from tools.admin_results import get_school_performance_summary, get_class_exam_results
+from tools.knowledge_base import search_knowledge_base
 
 router = APIRouter()
 
@@ -59,6 +60,35 @@ _STREAM_HOLD_BACK_CHARS = 120
 # OpenAI wraps each tool in {"type": "function", "function": {...}}.
 # The "parameters" field is standard JSON Schema — same content as Anthropic's
 # "input_schema", just a different wrapper key name.
+
+# Shared across all three roles — every role can ask about school policies/handbooks
+# (see tools/knowledge_base.py). Retrieval itself is schoolId-scoped server-side by
+# Spring Boot, same as every other tool, so there's no extra scoping needed here.
+_SEARCH_KNOWLEDGE_BASE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "search_knowledge_base",
+        "description": (
+            "Search the school's uploaded policy documents and handbooks (attendance policy, "
+            "leave policy, fee policy, exam guidelines, student handbook, code of conduct, etc.) "
+            "for content relevant to the user's question. Call this when the user asks about a "
+            "school POLICY, RULE, or GUIDELINE — e.g. 'what is the leave policy', 'how many sick "
+            "leaves am I allowed', 'what are the exam rules', 'what does the handbook say about "
+            "uniforms'. Do NOT use this for the user's own live data (actual attendance/fees/marks) "
+            "— use the other tools for that."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The user's question, or a short natural-language description of what to search for.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
 
 STUDENT_TOOLS: list[dict] = [
     {
@@ -151,7 +181,8 @@ STUDENT_TOOLS: list[dict] = [
                 "required": ["type"],
             },
         },
-    }
+    },
+    _SEARCH_KNOWLEDGE_BASE_TOOL,
 ]
 
 # ─── Teacher tools ─────────────────────────────────────────────────────────────
@@ -250,6 +281,7 @@ TEACHER_TOOLS: list[dict] = [
             },
         },
     },
+    _SEARCH_KNOWLEDGE_BASE_TOOL,
 ]
 
 # ─── Admin tools ───────────────────────────────────────────────────────────────
@@ -412,6 +444,7 @@ ADMIN_TOOLS: list[dict] = [
             },
         },
     },
+    _SEARCH_KNOWLEDGE_BASE_TOOL,
 ]
 
 
@@ -419,6 +452,7 @@ _STUDENT_PROMPT_BODY = """## Available tools
 - get_fee_summary — use when the student asks about fees, pending payments, paid months, or outstanding amounts.
 - get_attendance_summary — use when the student asks about attendance, absences, or attendance percentage.
 - get_results_summary — use when the student asks about marks, exam results, scores, grades, rank, or performance.
+- search_knowledge_base — use when the student asks about a school POLICY, RULE, or GUIDELINE (e.g. leave policy, attendance policy, exam rules, handbook, uniform rules) rather than their own live data.
 
 You may call multiple tools in a single turn if the user asks about more than one topic (e.g. "show me my attendance and results").
 
@@ -450,6 +484,11 @@ Do NOT call any tool for:
 - If the tool returns noResultsYet=true, tell the student no exam results have been published yet — do NOT say "unable to fetch".
 - If the tool returns an error field starting with "Spring Boot returned", say results could not be loaded and share the error code. Do not fabricate data.
 
+## When answering from the knowledge base (search_knowledge_base)
+- Only state policy details that appear in the tool's returned chunks — never fill gaps from general knowledge or assumption, school policies vary and a plausible-sounding guess is still wrong.
+- End the answer with the source document title(s) it came from, e.g. "**Source:** Leave Policy 2026.pdf".
+- If found=false or the results don't actually answer the question, say plainly that the school hasn't published anything covering that — do not improvise an answer.
+
 ## General behaviour
 - Never guess or fabricate numbers — only report what tools return.
 - Only use numbers from a tool call made THIS turn — never reuse or repurpose a number mentioned in an earlier reply for a new, different question (e.g. an attendance percentage is not an exam score). Call the relevant tool again if you need current data.
@@ -462,8 +501,9 @@ _TEACHER_PROMPT_BODY = """## Available tools
 - get_class_attendance_summary — use when the teacher asks how their class's attendance is doing overall (averages, how many students are below 75%).
 - get_low_attendance_students — use when the teacher asks WHICH students have low/poor attendance, are missing too many days, or need attention on attendance.
 - get_class_performance_summary — use when the teacher asks how their class performed in an exam, which students need academic attention, or which subjects students are struggling with.
+- search_knowledge_base — use when the teacher asks about a school POLICY, RULE, or GUIDELINE (e.g. leave policy, attendance policy, exam guidelines, handbook) rather than live class data.
 
-All three tools are automatically scoped to the teacher's own assigned class — there is no className argument, so you never need to ask the teacher which class they mean.
+The three class-data tools are automatically scoped to the teacher's own assigned class — there is no className argument, so you never need to ask the teacher which class they mean. search_knowledge_base is school-wide, not class-scoped.
 
 You may call multiple tools in a single turn if the user asks about more than one topic (e.g. "how's my class doing overall" could warrant both attendance and performance).
 
@@ -491,6 +531,11 @@ If the user asks something ambiguous like "which students need attention", consi
 - If noExamsYet is true, say clearly that no exams are configured yet — do NOT say "unable to fetch".
 - If the tool returns an "availableExams" list (exam name not found), tell the teacher which exam names actually exist instead of failing silently.
 
+## When answering from the knowledge base (search_knowledge_base)
+- Only state policy details that appear in the tool's returned chunks — never fill gaps from general knowledge or assumption.
+- End the answer with the source document title(s) it came from, e.g. "**Source:** Leave Policy 2026.pdf".
+- If found=false or the results don't actually answer the question, say plainly the school hasn't published anything covering that — do not improvise an answer.
+
 ## General behaviour
 - Never guess or fabricate numbers, student names, or subjects — only report what tools return.
 - Only use numbers from a tool call made THIS turn — never reuse or repurpose a number mentioned in an earlier reply for a new, different question (e.g. an attendance percentage is not an exam score). Call the relevant tool again if you need current data.
@@ -506,6 +551,7 @@ _ADMIN_PROMPT_BODY = """## Available tools
 - get_fee_defaulters — use when the admin asks about pending fees, how many students owe money, or fee defaulters.
 - get_school_performance_summary — use for class-level exam performance (best/worst class, weakest subjects) AND for "which student is weakest/strongest academically" when no specific class is named (see schoolWideTopPerformers / schoolWideNeedingAttention).
 - get_class_exam_results — the ONLY tool with individual exam scores for a named class (top scorer, lowest scorer, full ranked list). Use whenever the admin names a specific class and asks about individual student performance in it (e.g. "who scored lowest in Class 2's exam").
+- search_knowledge_base — use when the admin asks about a school POLICY, RULE, or GUIDELINE (e.g. leave policy, attendance policy, fee policy, exam guidelines, handbook) rather than live structured data.
 
 For broad questions (e.g. "give me an overall school summary"), call multiple relevant tools in the same turn and present the results in sections — don't limit yourself to one.
 For ambiguous requests like "which students/classes need attention", consider calling get_school_low_attendance_students, get_fee_defaulters, and get_school_performance_summary together unless the phrasing clearly points to just one domain.
@@ -554,6 +600,11 @@ These are DIFFERENT metrics from DIFFERENT tools — never substitute one for an
 - Lead with total defaulter count and total amount due.
 - Break down by class if byClass has more than one entry.
 - Name the most overdue students specifically from mostOverdue.
+
+## When answering from the knowledge base (search_knowledge_base)
+- Only state policy details that appear in the tool's returned chunks — never fill gaps from general knowledge or assumption.
+- End the answer with the source document title(s) it came from, e.g. "**Source:** Leave Policy 2026.pdf".
+- If found=false or the results don't actually answer the question, say plainly the school hasn't published anything covering that — do not improvise an answer.
 
 ## General behaviour
 - Never guess or fabricate numbers, student names, class names, or subjects — only report what tools return.
@@ -695,6 +746,13 @@ async def _execute_tool(
             examName=tool_input.get("examName"),
         )
 
+    if tool_name == "search_knowledge_base":
+        return await search_knowledge_base(
+            user=user,
+            access_token=access_token,
+            query=tool_input["query"],
+        )
+
     return {"error": f"Unknown tool '{tool_name}'."}
 
 
@@ -809,7 +867,7 @@ async def chat(
 # accumulated but never written to the response stream.
 
 
-async def _stream_chat_response(request: ChatRequest) -> AsyncGenerator[str, None]:
+async def _stream_chat_response(request: ChatRequest, http_request: Request) -> AsyncGenerator[str, None]:
     history = await memory.get_history(
         request.user.schoolId, request.user.userId, request.conversationId
     )
@@ -828,6 +886,7 @@ async def _stream_chat_response(request: ChatRequest) -> AsyncGenerator[str, Non
 
     full_reply = ""
     errored = False
+    interrupted = False  # user hit "stop" — client gone, no point doing more work
 
     try:
         for _ in range(5):  # Safety cap — prevents infinite loops, same as /chat
@@ -847,6 +906,13 @@ async def _stream_chat_response(request: ChatRequest) -> AsyncGenerator[str, Non
             finish_reason: str | None = None
 
             async for chunk in stream:
+                if await http_request.is_disconnected():
+                    # User hit "stop" (or the tab/connection just died). Bytes we yield
+                    # from here on have no one to reach — stop pulling more tokens from
+                    # DeepSeek immediately rather than burning the rest of the turn.
+                    interrupted = True
+                    break
+
                 choice = chunk.choices[0]
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
@@ -889,6 +955,10 @@ async def _stream_chat_response(request: ChatRequest) -> AsyncGenerator[str, Non
                             full_reply += held_back
                             yield held_back
                             held_back = ""
+
+            if interrupted:
+                await stream.close()  # release the DeepSeek connection immediately, don't let it keep generating
+                break
 
             if not saw_tool_call and held_back:
                 # Turn ended (short final answer) without ever crossing the threshold — flush the rest.
@@ -936,13 +1006,13 @@ async def _stream_chat_response(request: ChatRequest) -> AsyncGenerator[str, Non
         full_reply += msg
         yield msg
 
-    if not full_reply:
+    if not full_reply and not interrupted:
         full_reply = "I wasn't able to complete your request. Please try again."
         yield full_reply
 
-    # Only persist a clean, complete reply — never a partial/errored one, so a
-    # broken turn doesn't pollute the next turn's memory with a garbled reply.
-    if not errored:
+    # Only persist a clean, complete reply — never a partial/errored/interrupted one, so
+    # a broken or stopped turn doesn't pollute the next turn's memory with a garbled reply.
+    if not errored and not interrupted:
         await memory.append_turn(
             request.user.schoolId,
             request.user.userId,
@@ -956,9 +1026,10 @@ async def _stream_chat_response(request: ChatRequest) -> AsyncGenerator[str, Non
 @router.post("/chat/stream")
 async def chat_stream(
     request: ChatRequest,
+    http_request: Request,
     x_internal_secret: str = Header(alias="X-Internal-Secret"),
 ) -> StreamingResponse:
     if x_internal_secret != settings.internal_secret:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    return StreamingResponse(_stream_chat_response(request), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(_stream_chat_response(request, http_request), media_type="text/plain; charset=utf-8")

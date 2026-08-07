@@ -7,7 +7,7 @@ Spring Boot is the only caller. All business auth lives in Spring Boot.
 from fastapi import FastAPI
 
 import memory
-from routers import chat
+from routers import chat, knowledge_base
 
 app = FastAPI(
     title="Edunexify AI Service",
@@ -19,6 +19,7 @@ app = FastAPI(
 )
 
 app.include_router(chat.router)
+app.include_router(knowledge_base.router)
 
 
 @app.get("/health")

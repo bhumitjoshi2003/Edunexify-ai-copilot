@@ -13,6 +13,12 @@ class Settings(BaseSettings):
     deepseek_api_key: str
     internal_secret: str  # Shared secret between Spring Boot and this service
 
+    # DeepSeek doesn't serve an embeddings endpoint — used only for the Knowledge
+    # Base (RAG) feature: text-embedding-3-small on documents at upload time and
+    # on the user's question at query time. Separate key/client from `deepseek_api_key`.
+    openai_api_key: str = ""
+    embedding_model: str = "text-embedding-3-small"
+
     # Optional — sensible defaults for local development
     spring_boot_url: str = "http://localhost:8080"
 
