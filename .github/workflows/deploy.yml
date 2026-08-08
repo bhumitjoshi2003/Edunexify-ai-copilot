@@ -22,6 +22,7 @@ jobs:
         env:
           DEEPSEEK_API_KEY: dummy-for-import-check
           INTERNAL_SECRET: dummy-for-import-check
+          OPENAI_API_KEY: dummy-for-import-check
         run: |
           pip install -r requirements.txt
           python -c "import main"
@@ -67,4 +68,5 @@ jobs:
               -e INTERNAL_SECRET='${{ secrets.AI_INTERNAL_SECRET }}' \
               -e SPRING_BOOT_URL='${{ secrets.SPRING_BOOT_URL }}' \
               -e REDIS_URL='${{ secrets.REDIS_URL }}' \
+              -e OPENAI_API_KEY='${{ secrets.OPENAI_API_KEY }}' \
               edunexify-ai

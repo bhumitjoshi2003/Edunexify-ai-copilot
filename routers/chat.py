@@ -485,9 +485,12 @@ Do NOT call any tool for:
 - If the tool returns an error field starting with "Spring Boot returned", say results could not be loaded and share the error code. Do not fabricate data.
 
 ## When answering from the knowledge base (search_knowledge_base)
-- Only state policy details that appear in the tool's returned chunks — never fill gaps from general knowledge or assumption, school policies vary and a plausible-sounding guess is still wrong.
-- End the answer with the source document title(s) it came from, e.g. "**Source:** Leave Policy 2026.pdf".
-- If found=false or the results don't actually answer the question, say plainly that the school hasn't published anything covering that — do not improvise an answer.
+- Treat the returned chunks as the ONLY source for policy content — never add typical/generic school-policy knowledge from general training, even if it sounds plausible or is commonly true elsewhere.
+- Preserve the exact modal strength of the source wording: "may" is not "must" or "is required"; "should" is not "must"; "can" is not "will". Never upgrade optional/permissive language into a requirement, or soften a requirement into an option.
+- If a chunk doesn't state a specific number, amount, deadline, or procedure, say so — do NOT invent one. Example: a chunk saying "lost books may require replacement or payment according to library rules" has no stated amount — say the policy doesn't specify an exact fee, don't name a dollar figure.
+- Each result has a similarity score; results below a relevance floor are already excluded server-side. If found=false, or the returned chunks don't actually address what was asked, say plainly that the Knowledge Base doesn't have enough information on this — do NOT answer from general knowledge, and do NOT imply a negative ("the school doesn't offer this") when the real situation is "not covered by the documents."
+- Keep this evidence separate from live tool data (attendance/fees/marks) — never blend a retrieved policy detail with a number from another tool.
+- Cite the source as "**Source:** <document title>" (add ", page N" if a page number is given) at the end of the answer.
 
 ## General behaviour
 - Never guess or fabricate numbers — only report what tools return.
@@ -532,9 +535,12 @@ If the user asks something ambiguous like "which students need attention", consi
 - If the tool returns an "availableExams" list (exam name not found), tell the teacher which exam names actually exist instead of failing silently.
 
 ## When answering from the knowledge base (search_knowledge_base)
-- Only state policy details that appear in the tool's returned chunks — never fill gaps from general knowledge or assumption.
-- End the answer with the source document title(s) it came from, e.g. "**Source:** Leave Policy 2026.pdf".
-- If found=false or the results don't actually answer the question, say plainly the school hasn't published anything covering that — do not improvise an answer.
+- Treat the returned chunks as the ONLY source for policy content — never add typical/generic school-policy knowledge from general training, even if it sounds plausible or is commonly true elsewhere.
+- Preserve the exact modal strength of the source wording: "may" is not "must" or "is required"; "should" is not "must"; "can" is not "will". Never upgrade optional/permissive language into a requirement, or soften a requirement into an option.
+- If a chunk doesn't state a specific number, amount, deadline, or procedure, say so — do NOT invent one. Example: a chunk saying "lost books may require replacement or payment according to library rules" has no stated amount — say the policy doesn't specify an exact fee, don't name a dollar figure.
+- Each result has a similarity score; results below a relevance floor are already excluded server-side. If found=false, or the returned chunks don't actually address what was asked, say plainly that the Knowledge Base doesn't have enough information on this — do NOT answer from general knowledge, and do NOT imply a negative ("the school doesn't offer this") when the real situation is "not covered by the documents."
+- Keep this evidence separate from live tool data (attendance/fees/marks) — never blend a retrieved policy detail with a number from another tool.
+- Cite the source as "**Source:** <document title>" (add ", page N" if a page number is given) at the end of the answer.
 
 ## General behaviour
 - Never guess or fabricate numbers, student names, or subjects — only report what tools return.
@@ -602,9 +608,12 @@ These are DIFFERENT metrics from DIFFERENT tools — never substitute one for an
 - Name the most overdue students specifically from mostOverdue.
 
 ## When answering from the knowledge base (search_knowledge_base)
-- Only state policy details that appear in the tool's returned chunks — never fill gaps from general knowledge or assumption.
-- End the answer with the source document title(s) it came from, e.g. "**Source:** Leave Policy 2026.pdf".
-- If found=false or the results don't actually answer the question, say plainly the school hasn't published anything covering that — do not improvise an answer.
+- Treat the returned chunks as the ONLY source for policy content — never add typical/generic school-policy knowledge from general training, even if it sounds plausible or is commonly true elsewhere.
+- Preserve the exact modal strength of the source wording: "may" is not "must" or "is required"; "should" is not "must"; "can" is not "will". Never upgrade optional/permissive language into a requirement, or soften a requirement into an option.
+- If a chunk doesn't state a specific number, amount, deadline, or procedure, say so — do NOT invent one. Example: a chunk saying "lost books may require replacement or payment according to library rules" has no stated amount — say the policy doesn't specify an exact fee, don't name a dollar figure.
+- Each result has a similarity score; results below a relevance floor are already excluded server-side. If found=false, or the returned chunks don't actually address what was asked, say plainly that the Knowledge Base doesn't have enough information on this — do NOT answer from general knowledge, and do NOT imply a negative ("the school doesn't offer this") when the real situation is "not covered by the documents."
+- Keep this evidence separate from live tool data (attendance/fees/marks) — never blend a retrieved policy detail with a number from another tool.
+- Cite the source as "**Source:** <document title>" (add ", page N" if a page number is given) at the end of the answer.
 
 ## General behaviour
 - Never guess or fabricate numbers, student names, class names, or subjects — only report what tools return.
@@ -793,7 +802,11 @@ async def chat(
     reply_text: str | None = None
     try:
         for _ in range(5):  # Safety cap — prevents infinite loops
-            completion_kwargs: dict = {"model": "deepseek-chat", "messages": messages}
+            # Lower than the ~1.0 default: this app's answers are grounded in tool/RAG
+            # data, not creative writing, and a lower temperature measurably reduces
+            # the model embellishing retrieved text with plausible-sounding but
+            # unsupported specifics (see the Knowledge Base grounding fixes).
+            completion_kwargs: dict = {"model": "deepseek-chat", "messages": messages, "temperature": 0.3}
             if role_tools:
                 completion_kwargs["tools"] = role_tools
                 completion_kwargs["tool_choice"] = "auto"
@@ -890,7 +903,9 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
 
     try:
         for _ in range(5):  # Safety cap — prevents infinite loops, same as /chat
-            completion_kwargs: dict = {"model": "deepseek-chat", "messages": messages, "stream": True}
+            completion_kwargs: dict = {
+                "model": "deepseek-chat", "messages": messages, "stream": True, "temperature": 0.3,
+            }
             if role_tools:
                 completion_kwargs["tools"] = role_tools
                 completion_kwargs["tool_choice"] = "auto"

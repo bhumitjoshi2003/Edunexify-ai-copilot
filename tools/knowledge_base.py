@@ -8,6 +8,8 @@ docstring): we forward the user's own accessToken cookie, so Spring's normal
 @PreAuthorize + schoolId scoping applies unchanged — this tool has no way to
 reach another school's documents.
 """
+import re
+
 import httpx
 
 from config import settings
@@ -15,6 +17,13 @@ from schemas.chat import UserContext
 from services.embeddings import embed_texts
 
 _TOP_K = 5
+
+
+def _clean_title(title: str) -> str:
+    """Admin-entered titles sometimes default to a raw filename (e.g.
+    "Leave_Policy_2026") — present them more readably in citations without
+    touching the stored title shown as-is in the admin Knowledge Base list."""
+    return re.sub(r"[_-]+", " ", title).strip()
 
 
 async def search_knowledge_base(user: UserContext, access_token: str, query: str) -> dict:
@@ -36,8 +45,26 @@ async def search_knowledge_base(user: UserContext, access_token: str, query: str
     if response.status_code != 200:
         return {"error": f"Spring Boot returned {response.status_code}: {response.text}"}
 
-    results = response.json().get("results", [])
-    if not results:
-        return {"found": False, "message": "No matching content found in the school's knowledge base."}
+    # Spring already excludes anything below the relevance floor (see
+    # KnowledgeSearchRepository.search()) — an empty list here genuinely means
+    # nothing in the knowledge base is a good enough match, not just "the top
+    # result happened to be weak".
+    raw_results = response.json().get("results", [])
+    if not raw_results:
+        return {
+            "found": False,
+            "message": "No sufficiently relevant content found in the school's knowledge base for this question.",
+        }
+
+    results = [
+        {
+            "chunkText": r["chunkText"],
+            "documentTitle": _clean_title(r["documentTitle"]),
+            "documentId": r["documentId"],
+            "pageNumber": r.get("pageNumber"),
+            "similarity": round(r["similarity"], 3),
+        }
+        for r in raw_results
+    ]
 
     return {"found": True, "results": results}
