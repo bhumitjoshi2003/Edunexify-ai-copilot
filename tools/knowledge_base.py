@@ -16,7 +16,7 @@ from config import settings
 from schemas.chat import UserContext
 from services.embeddings import embed_texts
 
-_TOP_K = 5
+_TOP_K = 3
 
 
 def _clean_title(title: str) -> str:
