@@ -11,6 +11,7 @@ Tools are defined as {"type": "function", "function": {"name", "description", "p
 and tool results are returned as {"role": "tool", "tool_call_id": ..., "content": ...}.
 """
 import json
+import time
 from collections.abc import AsyncGenerator
 from datetime import date
 
@@ -20,6 +21,7 @@ from openai import APIStatusError, AsyncOpenAI, OpenAI
 
 import memory
 from config import settings
+from tracing import Trace, summarize_tool_result
 from schemas.chat import ChatRequest, ChatResponse, UserContext
 from tools.attendance import get_attendance_summary, current_academic_session
 from tools.fees import get_fee_summary
@@ -490,14 +492,12 @@ Do NOT call any tool for:
 - If a chunk doesn't state a specific number, amount, deadline, or procedure, say so — do NOT invent one. Example: a chunk saying "lost books may require replacement or payment according to library rules" has no stated amount — say the policy doesn't specify an exact fee, don't name a dollar figure.
 - Each result has a similarity score; results below a relevance floor are already excluded server-side. If found=false, or the returned chunks don't actually address what was asked, say plainly that the Knowledge Base doesn't have enough information on this — do NOT answer from general knowledge, and do NOT imply a negative ("the school doesn't offer this") when the real situation is "not covered by the documents."
 - Keep this evidence separate from live tool data (attendance/fees/marks) — never blend a retrieved policy detail with a number from another tool.
-- Cite the source as "**Source:** <document title>" (add ", page N" if a page number is given) at the end of the answer.
 
 ## General behaviour
 - Never guess or fabricate numbers — only report what tools return.
 - Only use numbers from a tool call made THIS turn — never reuse or repurpose a number mentioned in an earlier reply for a new, different question (e.g. an attendance percentage is not an exam score). Call the relevant tool again if you need current data.
 - If a tool returns an error or a "message" field (no data yet), relay that clearly.
 - When the user asks about multiple topics, call all relevant tools and present results in sections.
-- Be concise and direct. Do NOT end responses with "Is there anything else you'd like to know?" or similar filler.
 - Use emojis sparingly — only where they add meaning, not as decoration. Never use a cheerful emoji (😊 😄) when reporting a problem like unpaid fees or low attendance."""
 
 _TEACHER_PROMPT_BODY = """## Available tools
@@ -540,14 +540,12 @@ If the user asks something ambiguous like "which students need attention", consi
 - If a chunk doesn't state a specific number, amount, deadline, or procedure, say so — do NOT invent one. Example: a chunk saying "lost books may require replacement or payment according to library rules" has no stated amount — say the policy doesn't specify an exact fee, don't name a dollar figure.
 - Each result has a similarity score; results below a relevance floor are already excluded server-side. If found=false, or the returned chunks don't actually address what was asked, say plainly that the Knowledge Base doesn't have enough information on this — do NOT answer from general knowledge, and do NOT imply a negative ("the school doesn't offer this") when the real situation is "not covered by the documents."
 - Keep this evidence separate from live tool data (attendance/fees/marks) — never blend a retrieved policy detail with a number from another tool.
-- Cite the source as "**Source:** <document title>" (add ", page N" if a page number is given) at the end of the answer.
 
 ## General behaviour
 - Never guess or fabricate numbers, student names, or subjects — only report what tools return.
 - Only use numbers from a tool call made THIS turn — never reuse or repurpose a number mentioned in an earlier reply for a new, different question (e.g. an attendance percentage is not an exam score). Call the relevant tool again if you need current data.
 - If a tool returns an error or a "message" field (no data yet), relay that clearly.
 - When the user asks about multiple topics, call all relevant tools and present results in sections.
-- Be concise and direct. Do NOT end responses with "Is there anything else you'd like to know?" or similar filler.
 - Use emojis sparingly — only where they add meaning, not as decoration. Never use a cheerful emoji (😊 😄) when reporting a problem like low attendance or weak performance."""
 
 _ADMIN_PROMPT_BODY = """## Available tools
@@ -613,12 +611,10 @@ These are DIFFERENT metrics from DIFFERENT tools — never substitute one for an
 - If a chunk doesn't state a specific number, amount, deadline, or procedure, say so — do NOT invent one. Example: a chunk saying "lost books may require replacement or payment according to library rules" has no stated amount — say the policy doesn't specify an exact fee, don't name a dollar figure.
 - Each result has a similarity score; results below a relevance floor are already excluded server-side. If found=false, or the returned chunks don't actually address what was asked, say plainly that the Knowledge Base doesn't have enough information on this — do NOT answer from general knowledge, and do NOT imply a negative ("the school doesn't offer this") when the real situation is "not covered by the documents."
 - Keep this evidence separate from live tool data (attendance/fees/marks) — never blend a retrieved policy detail with a number from another tool.
-- Cite the source as "**Source:** <document title>" (add ", page N" if a page number is given) at the end of the answer.
 
 ## General behaviour
 - Never guess or fabricate numbers, student names, class names, or subjects — only report what tools return.
 - If a tool returns an "error" field, relay that message plainly rather than guessing at data.
-- Be concise and direct. Do NOT end responses with "Is there anything else you'd like to know?" or similar filler.
 - Use emojis sparingly — only where they add meaning, not as decoration. Never use a cheerful emoji (😊 😄) when reporting a problem like overdue fees, low attendance, or weak performance."""
 
 _DEFAULT_PROMPT_BODY = """No specific data tools are available for your role yet. Answer general questions about Edunexify only — do not claim to fetch live data."""
@@ -651,6 +647,34 @@ When you decide to call a tool, call it directly with NO preceding text — do n
 in the same turn as a tool call is shown to the user immediately and cannot be taken back, so only ever produce
 text there if it's part of your genuine final answer. Write your actual response only in the turn after your
 tool results come back, once you have real data to report.
+
+## Response style
+You are a professional school-admin assistant, not a chatbot demo — write like a knowledgeable staff member,
+not an AI narrating its own process.
+- Answer the user's exact question first. Lead with the answer, not a preamble.
+- Default to concise: roughly 2-3 sentences, unless the question genuinely needs more (a multi-subject
+  breakdown, a list of several students, several policy points) or the user explicitly asks for more detail.
+- Never narrate what you did to get the answer — don't say "Based on the Knowledge Base", "According to the
+  policy documents", "I searched...", "Let me check that for you", or similar. Just state the answer; the
+  citation (see below) handles attribution, you don't need to say it in prose too.
+- Don't tack on unprompted offers like "Would you like me to check X?" or "Let me know if you need anything
+  else" — only suggest a next step when it's the genuinely obvious continuation of what they just asked.
+
+## Citations
+Cite a source ONLY when your answer draws on search_knowledge_base — never for attendance/fee/exam/other live
+tool data, and never one citation per data source when an answer combines both. Put it on its own line at the
+very end of the answer, nothing else on that line:
+📄 <document title>[ · Page N]
+Use the document title and page number exactly as the tool gives them (omit the page part if none was given).
+Never mention similarity scores, chunk numbers/text, "results", or any other retrieval/tool-internal detail —
+those exist for you to reason with, not for the user to see.
+
+## Attendance vs. leave
+"Absent" (attendance data) and "on approved leave" are not the same thing — a student can be marked absent
+without ever submitting a leave request, and a submitted request is not automatically approved. Never describe
+attendance-absence numbers as "leave" or as "approved leave" unless you actually have leave-specific data
+confirming a request and its approval status. If asked about leave status/approval and you have no leave data
+available, say you don't have that information rather than inferring it from attendance.
 
 {body}"""
 
@@ -765,6 +789,34 @@ async def _execute_tool(
     return {"error": f"Unknown tool '{tool_name}'."}
 
 
+async def _execute_tool_traced(
+    tool_name: str,
+    tool_input: dict,
+    user: UserContext,
+    access_token: str,
+    trace: Trace,
+) -> dict:
+    """Wraps _execute_tool with timing + trace recording, used by both /chat and
+    /chat/stream's tool-calling loops so this instrumentation lives in one place."""
+    start = time.monotonic()
+    try:
+        result = await _execute_tool(tool_name, tool_input, user, access_token)
+        error = result.get("error") if isinstance(result, dict) else None
+    except Exception as e:
+        result = {"error": str(e)}
+        error = str(e)
+    latency_ms = (time.monotonic() - start) * 1000
+
+    trace.record_tool_call(
+        tool_name, latency_ms, success=(error is None), error=error,
+        result_summary=summarize_tool_result(result),
+    )
+    if tool_name == "search_knowledge_base" and isinstance(result, dict):
+        trace.record_rag_results(result.get("results"))
+
+    return result
+
+
 # ─── Main endpoint ────────────────────────────────────────────────────────────
 
 @router.post("/chat", response_model=ChatResponse)
@@ -798,6 +850,13 @@ async def chat(
         "ADMIN": ADMIN_TOOLS,
     }.get(request.user.role, [])
 
+    trace = Trace(
+        user=request.user,
+        conversation_id=request.conversationId,
+        user_message=request.message,
+        access_token=request.accessToken,
+    )
+
     # ─── Tool-calling loop ────────────────────────────────────────────────────
     reply_text: str | None = None
     try:
@@ -811,7 +870,13 @@ async def chat(
                 completion_kwargs["tools"] = role_tools
                 completion_kwargs["tool_choice"] = "auto"
 
+            _deepseek_start = time.monotonic()
             response = _client.chat.completions.create(**completion_kwargs)
+            trace.record_deepseek_call(
+                (time.monotonic() - _deepseek_start) * 1000,
+                response.usage,
+                response.choices[0].finish_reason,
+            )
 
             choice = response.choices[0]
 
@@ -827,11 +892,12 @@ async def chat(
                 for tool_call in choice.message.tool_calls:
                     tool_input = json.loads(tool_call.function.arguments) or {}
 
-                    tool_output = await _execute_tool(
+                    tool_output = await _execute_tool_traced(
                         tool_call.function.name,
                         tool_input,
                         request.user,
                         request.accessToken,
+                        trace,
                     )
 
                     messages.append({
@@ -845,6 +911,10 @@ async def chat(
                 break
 
     except APIStatusError as e:
+        trace.errored = True
+        trace.error_message = f"APIStatusError({e.status_code})"
+        trace.final_reply = ""
+        await trace.finish()
         if e.status_code == 402:
             raise HTTPException(status_code=503, detail="AI service is temporarily unavailable. Please try again later.")
         if e.status_code == 429:
@@ -853,6 +923,9 @@ async def chat(
 
     if reply_text is None:
         reply_text = "I wasn't able to complete your request. Please try again."
+
+    trace.final_reply = reply_text
+    await trace.finish()
 
     # Persist only the user-visible turn (not the intermediate tool-call
     # messages above) — see memory.py for why.
@@ -897,6 +970,13 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
         "ADMIN": ADMIN_TOOLS,
     }.get(request.user.role, [])
 
+    trace = Trace(
+        user=request.user,
+        conversation_id=request.conversationId,
+        user_message=request.message,
+        access_token=request.accessToken,
+    )
+
     full_reply = ""
     errored = False
     interrupted = False  # user hit "stop" — client gone, no point doing more work
@@ -905,11 +985,14 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
         for _ in range(5):  # Safety cap — prevents infinite loops, same as /chat
             completion_kwargs: dict = {
                 "model": "deepseek-chat", "messages": messages, "stream": True, "temperature": 0.3,
+                "stream_options": {"include_usage": True},
             }
             if role_tools:
                 completion_kwargs["tools"] = role_tools
                 completion_kwargs["tool_choice"] = "auto"
 
+            _deepseek_start = time.monotonic()
+            deepseek_usage = None
             stream = await _async_client.chat.completions.create(**completion_kwargs)
 
             turn_content = ""       # everything produced this turn, for context reconstruction below
@@ -927,6 +1010,14 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
                     # DeepSeek immediately rather than burning the rest of the turn.
                     interrupted = True
                     break
+
+                if chunk.usage:
+                    deepseek_usage = chunk.usage
+
+                if not chunk.choices:
+                    # The extra usage-only final chunk (stream_options.include_usage) has
+                    # no choices at all — nothing else to process for it.
+                    continue
 
                 choice = chunk.choices[0]
                 if choice.finish_reason:
@@ -971,6 +1062,8 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
                             yield held_back
                             held_back = ""
 
+            trace.record_deepseek_call((time.monotonic() - _deepseek_start) * 1000, deepseek_usage, finish_reason)
+
             if interrupted:
                 await stream.close()  # release the DeepSeek connection immediately, don't let it keep generating
                 break
@@ -997,7 +1090,9 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
 
                 for c in ordered_calls:
                     tool_input = json.loads(c["arguments"]) if c["arguments"] else {}
-                    tool_output = await _execute_tool(c["name"], tool_input, request.user, request.accessToken)
+                    tool_output = await _execute_tool_traced(
+                        c["name"], tool_input, request.user, request.accessToken, trace,
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": c["id"],
@@ -1009,6 +1104,7 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
 
     except APIStatusError as e:
         errored = True
+        trace.error_message = f"APIStatusError({e.status_code})"
         if e.status_code == 402 or e.status_code == 429:
             msg = "\n\n⚠️ AI Copilot is temporarily unavailable. Please try again later."
         else:
@@ -1017,6 +1113,7 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
         yield msg
     except Exception as e:
         errored = True
+        trace.error_message = str(e)
         msg = "\n\n⚠️ AI Copilot is temporarily unavailable. Please try again later."
         full_reply += msg
         yield msg
@@ -1036,6 +1133,13 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
             request.message,
             full_reply,
         )
+
+    # Fired only after every chunk has already been yielded above — never adds to
+    # perceived streaming latency (finish() itself is fire-and-forget besides).
+    trace.final_reply = full_reply
+    trace.errored = errored
+    trace.interrupted = interrupted
+    await trace.finish()
 
 
 @router.post("/chat/stream")

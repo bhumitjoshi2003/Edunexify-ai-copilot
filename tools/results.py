@@ -71,8 +71,6 @@ async def get_results_summary(
             timeout=10.0,
         )
 
-    print(f"[DEBUG get_results_summary] GET {url}?session={resolved_session} -> {response.status_code}: {response.text[:500]}")
-
     if response.status_code == 403:
         return {"error": "Access denied. You can only view your own results."}
     if response.status_code != 200:

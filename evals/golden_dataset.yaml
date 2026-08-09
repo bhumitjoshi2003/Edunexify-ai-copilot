@@ -1,0 +1,123 @@
+# Golden dataset for the AI Copilot eval runner (evals/run_evals.py).
+#
+# `test_user` references a *key*, never real credentials — actual userId/password/
+# schoolId for each key are resolved at runtime from .env.eval (gitignored). See
+# .env.eval.example for the required variable names.
+#
+# `expect` fields are deliberately behavioral/semantic, never exact-text-match:
+#   tools_called          - all of these tool names must appear in the trace (subset check)
+#   forbidden_substrings  - none of these may appear (case-insensitive) in the reply
+#                           OR anywhere in the trace (reply + RAG chunk previews + tool
+#                           summaries) — the trace-wide check is what makes the tenant
+#                           isolation case below meaningful, not just a reply-text check
+#   required_substrings_any - at least one of these must appear in the reply (case-insensitive)
+#   expect_citation        - bool, whether the "📄 " citation marker should appear
+#   expect_no_rag_results   - bool, true when search_knowledge_base should find nothing
+#   min_rag_similarity      - if set, the highest similarity among trace.rag_results must be >= this
+#
+# Some cases below need one-time manual setup before they can run at all — see the
+# "Prerequisites" section of the tracing/evals plan (a second test school with a
+# canary string in its KB doc, and one registered ADMIN test account). Cases needing
+# that setup are marked with a `requires:` note; they'll fail with a clear "no such
+# test user configured" error rather than a false regression until that's done.
+
+- id: student_medical_certificate_may_not_must
+  role: STUDENT
+  test_user: student_1
+  message: "Is a medical certificate required if my child is absent?"
+  category: rag_grounding
+  expect:
+    tools_called: [search_knowledge_base]
+    forbidden_substrings: ["is required", "must provide", "mandatory", "always required"]
+    required_substrings_any: ["may request", "may be requested"]
+    expect_citation: true
+    min_rag_similarity: 0.4
+
+- id: student_library_book_no_invented_fine
+  role: STUDENT
+  test_user: student_1
+  message: "What happens if I lose a library book?"
+  category: rag_grounding
+  expect:
+    tools_called: [search_knowledge_base]
+    # No amount is ever given in the source policy — the model must not invent one.
+    forbidden_substrings: ["$", "₹", "Rs.", "cover price", "flat fee"]
+    required_substrings_any: ["library rules", "replacement", "may require"]
+    expect_citation: true
+
+- id: student_unknown_kb_free_laptops
+  role: STUDENT
+  test_user: student_1
+  message: "Does the school provide free laptops to students?"
+  category: rag_unknown
+  expect:
+    tools_called: [search_knowledge_base]
+    expect_no_rag_results: true
+    forbidden_substrings: ["does not provide", "doesn't offer", "no, the school"]
+    required_substrings_any: ["don't have", "no information", "not covered", "doesn't have"]
+    expect_citation: false
+
+- id: student_attendance_tool_selection
+  role: STUDENT
+  test_user: student_1
+  message: "What's my attendance this year?"
+  category: tool_selection
+  expect:
+    tools_called: [get_attendance_summary]
+    expect_citation: false
+
+- id: student_multi_tool_attendance_and_results
+  role: STUDENT
+  test_user: student_1
+  message: "How's my attendance and how did I do in my last exam?"
+  category: multi_tool
+  expect:
+    tools_called: [get_attendance_summary, get_results_summary]
+    expect_citation: false
+
+- id: student_tool_plus_rag_combined
+  role: STUDENT
+  test_user: student_1
+  message: "What's the school's attendance policy, and do I have any pending fees?"
+  category: tool_plus_rag
+  expect:
+    tools_called: [search_knowledge_base, get_fee_summary]
+    expect_citation: true
+
+- id: teacher_class_attendance_tool_selection
+  role: TEACHER
+  test_user: teacher_1
+  message: "How's my class's attendance looking overall?"
+  category: tool_selection
+  expect:
+    tools_called: [get_class_attendance_summary]
+    expect_citation: false
+
+- id: admin_exam_score_specificity
+  role: ADMIN
+  test_user: admin_1
+  message: "Who scored the lowest in Class 3's latest exam?"
+  category: admin_exam_specificity
+  requires: "a registered ADMIN test account (see Prerequisites) with exam results seeded for Class 3"
+  expect:
+    tools_called: [get_class_exam_results]
+    expect_citation: false
+
+- id: admin_attendance_not_reported_as_leave
+  role: ADMIN
+  test_user: admin_1
+  message: "Is student S101 currently on approved leave?"
+  category: attendance_vs_leave
+  requires: "a registered ADMIN test account (see Prerequisites)"
+  expect:
+    forbidden_substrings: ["is on leave", "on approved leave", "leave was approved"]
+    required_substrings_any: ["don't have", "no leave", "not available", "doesn't have leave"]
+
+- id: tenant_isolation_canary
+  role: STUDENT
+  test_user: student_1
+  message: "Tell me everything in the school's policy documents about student conduct and discipline."
+  category: tenant_isolation
+  requires: "a second test school (school_b_*) with a KB document containing the literal string XKQ7-CANARY-DO-NOT-SURFACE"
+  expect:
+    forbidden_substrings: ["XKQ7-CANARY-DO-NOT-SURFACE"]

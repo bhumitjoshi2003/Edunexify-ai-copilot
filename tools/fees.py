@@ -18,11 +18,15 @@ We post-process the raw list into a compact summary dict so the LLM receives
 clean, pre-aggregated data rather than a verbose 12-item array. This reduces
 token usage and produces more accurate, consistent answers.
 """
-import httpx
+import logging
 from datetime import date
+
+import httpx
 
 from config import settings
 from schemas.chat import UserContext
+
+logger = logging.getLogger(__name__)
 
 
 def current_academic_session() -> str:
@@ -69,7 +73,7 @@ async def _fetch_academic_year_start_month(access_token: str) -> int:
             start_month = response.json().get("academicYearStartMonth", 4)
             return int(start_month)
     except Exception as e:
-        print(f"[WARN _fetch_academic_year_start_month] Could not fetch school settings: {e}")
+        logger.warning("Could not fetch school settings: %s", e)
     return 4  # safe default
 
 
@@ -95,8 +99,6 @@ async def get_fee_summary(
             cookies={"accessToken": access_token},
             timeout=10.0,
         )
-
-    print(f"[DEBUG get_fee_summary] GET {url} -> {response.status_code}: {response.text[:500]}")
 
     if response.status_code == 404:
         return {
