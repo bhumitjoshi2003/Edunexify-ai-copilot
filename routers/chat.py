@@ -11,6 +11,7 @@ Tools are defined as {"type": "function", "function": {"name", "description", "p
 and tool results are returned as {"role": "tool", "tool_call_id": ..., "content": ...}.
 """
 import json
+import time
 from collections.abc import AsyncGenerator
 from datetime import date
 
@@ -20,6 +21,7 @@ from openai import APIStatusError, AsyncOpenAI, OpenAI
 
 import memory
 from config import settings
+from tracing import Trace, summarize_tool_result
 from schemas.chat import ChatRequest, ChatResponse, UserContext
 from tools.attendance import get_attendance_summary, current_academic_session
 from tools.fees import get_fee_summary
@@ -787,6 +789,34 @@ async def _execute_tool(
     return {"error": f"Unknown tool '{tool_name}'."}
 
 
+async def _execute_tool_traced(
+    tool_name: str,
+    tool_input: dict,
+    user: UserContext,
+    access_token: str,
+    trace: Trace,
+) -> dict:
+    """Wraps _execute_tool with timing + trace recording, used by both /chat and
+    /chat/stream's tool-calling loops so this instrumentation lives in one place."""
+    start = time.monotonic()
+    try:
+        result = await _execute_tool(tool_name, tool_input, user, access_token)
+        error = result.get("error") if isinstance(result, dict) else None
+    except Exception as e:
+        result = {"error": str(e)}
+        error = str(e)
+    latency_ms = (time.monotonic() - start) * 1000
+
+    trace.record_tool_call(
+        tool_name, latency_ms, success=(error is None), error=error,
+        result_summary=summarize_tool_result(result),
+    )
+    if tool_name == "search_knowledge_base" and isinstance(result, dict):
+        trace.record_rag_results(result.get("results"))
+
+    return result
+
+
 # ─── Main endpoint ────────────────────────────────────────────────────────────
 
 @router.post("/chat", response_model=ChatResponse)
@@ -820,6 +850,13 @@ async def chat(
         "ADMIN": ADMIN_TOOLS,
     }.get(request.user.role, [])
 
+    trace = Trace(
+        user=request.user,
+        conversation_id=request.conversationId,
+        user_message=request.message,
+        access_token=request.accessToken,
+    )
+
     # ─── Tool-calling loop ────────────────────────────────────────────────────
     reply_text: str | None = None
     try:
@@ -833,7 +870,13 @@ async def chat(
                 completion_kwargs["tools"] = role_tools
                 completion_kwargs["tool_choice"] = "auto"
 
+            _deepseek_start = time.monotonic()
             response = _client.chat.completions.create(**completion_kwargs)
+            trace.record_deepseek_call(
+                (time.monotonic() - _deepseek_start) * 1000,
+                response.usage,
+                response.choices[0].finish_reason,
+            )
 
             choice = response.choices[0]
 
@@ -849,11 +892,12 @@ async def chat(
                 for tool_call in choice.message.tool_calls:
                     tool_input = json.loads(tool_call.function.arguments) or {}
 
-                    tool_output = await _execute_tool(
+                    tool_output = await _execute_tool_traced(
                         tool_call.function.name,
                         tool_input,
                         request.user,
                         request.accessToken,
+                        trace,
                     )
 
                     messages.append({
@@ -867,6 +911,10 @@ async def chat(
                 break
 
     except APIStatusError as e:
+        trace.errored = True
+        trace.error_message = f"APIStatusError({e.status_code})"
+        trace.final_reply = ""
+        await trace.finish()
         if e.status_code == 402:
             raise HTTPException(status_code=503, detail="AI service is temporarily unavailable. Please try again later.")
         if e.status_code == 429:
@@ -875,6 +923,9 @@ async def chat(
 
     if reply_text is None:
         reply_text = "I wasn't able to complete your request. Please try again."
+
+    trace.final_reply = reply_text
+    await trace.finish()
 
     # Persist only the user-visible turn (not the intermediate tool-call
     # messages above) — see memory.py for why.
@@ -919,6 +970,13 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
         "ADMIN": ADMIN_TOOLS,
     }.get(request.user.role, [])
 
+    trace = Trace(
+        user=request.user,
+        conversation_id=request.conversationId,
+        user_message=request.message,
+        access_token=request.accessToken,
+    )
+
     full_reply = ""
     errored = False
     interrupted = False  # user hit "stop" — client gone, no point doing more work
@@ -927,11 +985,14 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
         for _ in range(5):  # Safety cap — prevents infinite loops, same as /chat
             completion_kwargs: dict = {
                 "model": "deepseek-chat", "messages": messages, "stream": True, "temperature": 0.3,
+                "stream_options": {"include_usage": True},
             }
             if role_tools:
                 completion_kwargs["tools"] = role_tools
                 completion_kwargs["tool_choice"] = "auto"
 
+            _deepseek_start = time.monotonic()
+            deepseek_usage = None
             stream = await _async_client.chat.completions.create(**completion_kwargs)
 
             turn_content = ""       # everything produced this turn, for context reconstruction below
@@ -949,6 +1010,14 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
                     # DeepSeek immediately rather than burning the rest of the turn.
                     interrupted = True
                     break
+
+                if chunk.usage:
+                    deepseek_usage = chunk.usage
+
+                if not chunk.choices:
+                    # The extra usage-only final chunk (stream_options.include_usage) has
+                    # no choices at all — nothing else to process for it.
+                    continue
 
                 choice = chunk.choices[0]
                 if choice.finish_reason:
@@ -993,6 +1062,8 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
                             yield held_back
                             held_back = ""
 
+            trace.record_deepseek_call((time.monotonic() - _deepseek_start) * 1000, deepseek_usage, finish_reason)
+
             if interrupted:
                 await stream.close()  # release the DeepSeek connection immediately, don't let it keep generating
                 break
@@ -1019,7 +1090,9 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
 
                 for c in ordered_calls:
                     tool_input = json.loads(c["arguments"]) if c["arguments"] else {}
-                    tool_output = await _execute_tool(c["name"], tool_input, request.user, request.accessToken)
+                    tool_output = await _execute_tool_traced(
+                        c["name"], tool_input, request.user, request.accessToken, trace,
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": c["id"],
@@ -1031,6 +1104,7 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
 
     except APIStatusError as e:
         errored = True
+        trace.error_message = f"APIStatusError({e.status_code})"
         if e.status_code == 402 or e.status_code == 429:
             msg = "\n\n⚠️ AI Copilot is temporarily unavailable. Please try again later."
         else:
@@ -1039,6 +1113,7 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
         yield msg
     except Exception as e:
         errored = True
+        trace.error_message = str(e)
         msg = "\n\n⚠️ AI Copilot is temporarily unavailable. Please try again later."
         full_reply += msg
         yield msg
@@ -1058,6 +1133,13 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
             request.message,
             full_reply,
         )
+
+    # Fired only after every chunk has already been yielded above — never adds to
+    # perceived streaming latency (finish() itself is fire-and-forget besides).
+    trace.final_reply = full_reply
+    trace.errored = errored
+    trace.interrupted = interrupted
+    await trace.finish()
 
 
 @router.post("/chat/stream")
