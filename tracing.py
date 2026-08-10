@@ -67,6 +67,10 @@ class Trace:
     errored: bool = False
     error_message: str | None = None
     interrupted: bool = False
+    # Set when this turn started a workflow (e.g. via tools/admin_fee_workflows.py) — lets
+    # this turn's trace correlate with the workflow's own later approve/reject requests,
+    # via the same workflowId field AiTraceEvent already carries on the Spring side.
+    workflow_id: str | None = None
 
     _start: float = field(default_factory=time.monotonic)
 
@@ -117,6 +121,7 @@ class Trace:
             "userId": self.user.userId,
             "role": self.user.role,
             "conversationId": self.conversation_id,
+            "workflowId": self.workflow_id,
             "userMessage": self.user_message,
             "finalReply": self.final_reply,
             "toolsCalled": self.tool_calls,

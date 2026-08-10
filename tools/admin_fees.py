@@ -57,17 +57,30 @@ async def get_fee_defaulters(
             "message": "No students have pending fees for this session.",
         }
 
-    total_due = sum(d.get("totalDue") or 0 for d in defaulters)
+    # totalDue is null for a student whose class has no FeeStructure configured for this
+    # session — that means "amount unknown", not "₹0 due". Never coerce it to 0 in a sum:
+    # that would silently understate the total and imply those students owe nothing.
+    known_dues = [d["totalDue"] for d in defaulters if d.get("totalDue") is not None]
+    unknown_count = len(defaulters) - len(known_dues)
+    total_due = round(sum(known_dues), 2) if known_dues else None
 
-    by_class: dict[str, dict] = defaultdict(lambda: {"defaulterCount": 0, "totalDue": 0.0})
+    by_class: dict[str, dict] = defaultdict(lambda: {"defaulterCount": 0, "totalDue": 0.0, "unknownCount": 0})
     for d in defaulters:
         entry = by_class[d.get("className", "Unknown")]
         entry["defaulterCount"] += 1
-        entry["totalDue"] += d.get("totalDue") or 0
+        if d.get("totalDue") is not None:
+            entry["totalDue"] += d["totalDue"]
+        else:
+            entry["unknownCount"] += 1
 
     class_breakdown = sorted(
         (
-            {"className": cls, "defaulterCount": v["defaulterCount"], "totalDue": round(v["totalDue"], 2)}
+            {
+                "className": cls,
+                "defaulterCount": v["defaulterCount"],
+                "totalDue": round(v["totalDue"], 2) if v["unknownCount"] < v["defaulterCount"] else None,
+                "amountUnknownCount": v["unknownCount"],
+            }
             for cls, v in by_class.items()
         ),
         key=lambda x: -x["defaulterCount"],
@@ -79,7 +92,10 @@ async def get_fee_defaulters(
         "session": resolved_session,
         "className": className,
         "defaulterCount": len(defaulters),
-        "totalAmountDue": round(total_due, 2),
+        # None means no student in this result has a configured fee structure for the
+        # session — the model must say the amount is unknown, never state ₹0.
+        "totalAmountDue": total_due,
+        "amountUnknownCount": unknown_count,
         "byClass": class_breakdown,
         "mostOverdue": [
             {

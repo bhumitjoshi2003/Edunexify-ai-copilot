@@ -6,8 +6,9 @@ Spring Boot is the only caller. All business auth lives in Spring Boot.
 """
 from fastapi import FastAPI
 
+import checkpointer
 import memory
-from routers import chat, knowledge_base
+from routers import chat, knowledge_base, workflows_fee_reminders
 
 app = FastAPI(
     title="Edunexify AI Service",
@@ -20,6 +21,7 @@ app = FastAPI(
 
 app.include_router(chat.router)
 app.include_router(knowledge_base.router)
+app.include_router(workflows_fee_reminders.router)
 
 
 @app.get("/health")
@@ -30,3 +32,4 @@ def health() -> dict:
 @app.on_event("shutdown")
 async def shutdown() -> None:
     await memory.close()
+    await checkpointer.close()

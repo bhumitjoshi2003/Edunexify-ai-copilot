@@ -38,3 +38,9 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+    # Populated only when this turn started a workflow (e.g. the fee-reminder LangGraph
+    # workflow, via tools/admin_fee_workflows.py) — Spring's own response shape, passed
+    # through as-is. When set, `reply` is a short synthetic note for conversation memory,
+    # not meant to be shown as prose; Angular should render `workflow` as the approval
+    # card instead of `reply` as text.
+    workflow: dict | None = None

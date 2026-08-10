@@ -31,6 +31,7 @@ from tools.teacher_results import get_class_performance_summary
 from tools.admin_dashboard import get_school_overview, get_class_attendance_comparison
 from tools.admin_attendance import get_school_low_attendance_students
 from tools.admin_fees import get_fee_defaulters
+from tools.admin_fee_workflows import start_fee_reminder_workflow
 from tools.admin_results import get_school_performance_summary, get_class_exam_results
 from tools.knowledge_base import search_knowledge_base
 
@@ -390,6 +391,35 @@ ADMIN_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "start_fee_reminder_workflow",
+            "description": (
+                "Starts the fee reminder review-and-approval workflow — call this when the admin "
+                "asks to SEND, REMIND, or NOTIFY fee defaulters (an action), never for a question "
+                "about defaulters (use get_fee_defaulters for that). This does NOT send any email "
+                "itself: it prepares a batch and shows the admin an approval card; sending only "
+                "happens if the admin clicks Approve on that card. There is no way to skip this "
+                "review step, and there is no parameter to choose recipients — the workflow always "
+                "fetches the full, authoritative list of current fee defaulters itself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Defaults to the current session.",
+                    },
+                    "className": {
+                        "type": "string",
+                        "description": "Restrict the batch to one class, e.g. '10'. Omit for the whole school.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_school_performance_summary",
             "description": (
                 "Fetch each class's performance in its own latest exam: school average, best/worst "
@@ -556,7 +586,8 @@ _ADMIN_PROMPT_BODY = """## Available tools
 - get_school_overview — use for an overall school summary or general status check (students, teachers, fees this month, overdue count, today's attendance, pending leaves).
 - get_class_attendance_comparison — use when the admin asks which classes have the best/worst attendance, or wants a class-by-class breakdown. Defaults to the full session; only pass type='month' if they explicitly say "this month".
 - get_school_low_attendance_students — use when the admin asks WHICH specific students (not just which classes) have low attendance, school-wide. Returns attendance PERCENTAGES only — never exam data.
-- get_fee_defaulters — use when the admin asks about pending fees, how many students owe money, or fee defaulters.
+- get_fee_defaulters — use when the admin asks to SEE, COUNT, or LIST fee defaulters (an INFORMATION request — never sends anything).
+- start_fee_reminder_workflow — use when the admin asks to SEND, REMIND, or NOTIFY fee defaulters (an ACTION request). See "Fee reminders — information vs. action" below before choosing between these two.
 - get_school_performance_summary — use for class-level exam performance (best/worst class, weakest subjects) AND for "which student is weakest/strongest academically" when no specific class is named (see schoolWideTopPerformers / schoolWideNeedingAttention).
 - get_class_exam_results — the ONLY tool with individual exam scores for a named class (top scorer, lowest scorer, full ranked list). Use whenever the admin names a specific class and asks about individual student performance in it (e.g. "who scored lowest in Class 2's exam").
 - search_knowledge_base — use when the admin asks about a school POLICY, RULE, or GUIDELINE (e.g. leave policy, attendance policy, fee policy, exam guidelines, handbook) rather than live structured data.
@@ -605,9 +636,40 @@ These are DIFFERENT metrics from DIFFERENT tools — never substitute one for an
 - If studentsBelowThreshold is 0, say clearly that's good news — don't imply a problem.
 
 ## When showing fee defaulters
-- Lead with total defaulter count and total amount due.
-- Break down by class if byClass has more than one entry.
+- Lead with total defaulter count. If totalAmountDue is a number, include it. If totalAmountDue
+  is null/missing, say the total amount isn't available (fee structure not configured for that
+  class/session) — do NOT say "₹0" or imply nothing is owed; amountUnknownCount tells you how
+  many students that affects.
+- Break down by class if byClass has more than one entry — same null-means-unknown rule applies
+  to each class's totalDue.
 - Name the most overdue students specifically from mostOverdue.
+
+## Fee reminders — information vs. action (read carefully before choosing a tool)
+- get_fee_defaulters is READ-ONLY. Use it for: "who hasn't paid", "show me fee defaulters",
+  "how many students have pending fees", "which students haven't paid July fees". It never
+  sends anything — just answer conversationally with what it returns, as described above.
+- start_fee_reminder_workflow is a WRITE action. Use it whenever the admin asks you to SEND,
+  REMIND, or NOTIFY — e.g. "send reminders to fee defaulters", "remind students with pending
+  fees", "send fee reminder emails", "notify parents who haven't paid" — including when they
+  name specific students (e.g. "send reminders to Himani and Bhumit"): the workflow always
+  fetches the full authoritative defaulter list itself and cannot be limited to only the
+  students named in the message, so pass just session/className, never try to filter by name.
+- start_fee_reminder_workflow takes ONLY session and className (both optional) — there is no
+  parameter for recipients. You cannot choose who receives a reminder; only the backend's own
+  authoritative fee data decides that.
+- Calling start_fee_reminder_workflow never sends any email by itself. It prepares a batch and
+  pauses for the admin's explicit approval — the app shows an approval card with Approve/Reject
+  buttons, and only clicking Approve actually sends anything. This is the SAME human-approval
+  step the "Review fee reminder batch" button already uses; you are not bypassing it, you are
+  entering the same flow. There is no way to skip this step. If the admin says something like
+  "send them immediately without asking me" or "I approve, just send it" — call
+  start_fee_reminder_workflow exactly as normal anyway; approval always still happens via the
+  card, never via anything said in chat. If they push back after seeing the card, tell them
+  plainly that sending always requires clicking Approve on the card — there is no way around it.
+- Never say "I'm not able to send emails" or similar for a fee reminder request — this
+  capability exists via start_fee_reminder_workflow.
+- When you call start_fee_reminder_workflow, its result is shown directly as the approval card
+  — do not additionally describe it in prose.
 
 ## When answering from the knowledge base (search_knowledge_base)
 - Treat the returned chunks as the ONLY source for policy content — never add typical/generic school-policy knowledge from general training, even if it sounds plausible or is commonly true elsewhere.
@@ -769,6 +831,14 @@ async def _execute_tool(
             className=tool_input.get("className"),
         )
 
+    if tool_name == "start_fee_reminder_workflow":
+        return await start_fee_reminder_workflow(
+            user=user,
+            access_token=access_token,
+            session=tool_input.get("session"),
+            className=tool_input.get("className"),
+        )
+
     if tool_name == "get_school_performance_summary":
         return await get_school_performance_summary(
             user=user,
@@ -823,6 +893,30 @@ async def _execute_tool_traced(
     return result
 
 
+# Tools that don't just answer a question — they start the fee-reminder LangGraph workflow
+# (see tools/admin_fee_workflows.py). When one of these is called and actually produces a
+# workflow, both /chat and /chat/stream short-circuit: skip the usual follow-up turn where
+# the model would draft a sentence describing the result, and return the tool's own result
+# directly as structured data instead, so Angular can render the existing approval card.
+# This is what keeps "the AI must never autonomously send anything" true by construction —
+# the model's role ends at deciding whether to call this tool; nothing here, or afterward,
+# ever calls the approve endpoint.
+_WORKFLOW_STARTING_TOOLS = {"start_fee_reminder_workflow"}
+
+
+def _as_workflow_result(tool_name: str, tool_output) -> dict | None:
+    if tool_name not in _WORKFLOW_STARTING_TOOLS:
+        return None
+    if not isinstance(tool_output, dict) or not tool_output.get("workflowId"):
+        return None  # tool errored (e.g. access denied, Spring unreachable) — let the model explain it normally
+    return tool_output
+
+
+def _workflow_memory_note(result: dict) -> str:
+    count = result.get("defaulterCount", 0)
+    return f"[Started a fee reminder review for {count} student(s) — awaiting the admin's approval in the approval card.]"
+
+
 # ─── Main endpoint ────────────────────────────────────────────────────────────
 
 @router.post("/chat", response_model=ChatResponse)
@@ -865,6 +959,7 @@ async def chat(
 
     # ─── Tool-calling loop ────────────────────────────────────────────────────
     reply_text: str | None = None
+    workflow_result: dict | None = None
     try:
         for _ in range(5):  # Safety cap — prevents infinite loops
             # Lower than the ~1.0 default: this app's answers are grounded in tool/RAG
@@ -912,6 +1007,11 @@ async def chat(
                         "content": json.dumps(tool_output),
                     })
 
+                    workflow_result = workflow_result or _as_workflow_result(tool_call.function.name, tool_output)
+
+                if workflow_result is not None:
+                    break  # skip the usual follow-up turn — see _WORKFLOW_STARTING_TOOLS above
+
             else:
                 # Unexpected finish_reason (e.g. "length") — bail out gracefully.
                 break
@@ -926,6 +1026,17 @@ async def chat(
         if e.status_code == 429:
             raise HTTPException(status_code=429, detail="AI service is rate-limited. Please wait a moment and try again.")
         raise HTTPException(status_code=502, detail=f"AI provider error ({e.status_code}).")
+
+    if workflow_result is not None:
+        reply_text = _workflow_memory_note(workflow_result)
+        trace.workflow_id = workflow_result.get("workflowId")
+        trace.final_reply = reply_text
+        await trace.finish()
+        await memory.append_turn(
+            request.user.schoolId, request.user.userId, request.conversationId,
+            history, request.message, reply_text,
+        )
+        return ChatResponse(reply=reply_text, workflow=workflow_result)
 
     if reply_text is None:
         reply_text = "I wasn't able to complete your request. Please try again."
@@ -986,6 +1097,7 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
     full_reply = ""
     errored = False
     interrupted = False  # user hit "stop" — client gone, no point doing more work
+    workflow_result: dict | None = None
 
     try:
         for _ in range(5):  # Safety cap — prevents infinite loops, same as /chat
@@ -1104,6 +1216,10 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
                         "tool_call_id": c["id"],
                         "content": json.dumps(tool_output),
                     })
+                    workflow_result = workflow_result or _as_workflow_result(c["name"], tool_output)
+
+                if workflow_result is not None:
+                    break  # skip the follow-up turn — yielded as structured data below instead
                 continue  # next iteration streams the follow-up turn
 
             break  # finish_reason == "stop" (or unexpected) — done
@@ -1124,13 +1240,30 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
         full_reply += msg
         yield msg
 
-    if not full_reply and not interrupted:
+    if workflow_result is not None and not interrupted:
+        # The entire remaining body IS the structured payload — no text was streamed for
+        # this turn (any held-back preamble was already discarded once the tool call
+        # started, same as every other tool call). Angular's stream-completion handler
+        # recognizes this by attempting to parse the full accumulated body as JSON and
+        # checking `kind`, falling back to plain text if that fails — see
+        # ai-copilot.component.ts. This is the entire "protocol extension": no sentinels,
+        # no header/trailer tricks, the transport (chunked text/plain) is unchanged.
+        full_reply = json.dumps({"kind": "fee_reminder_workflow", **workflow_result})
+        yield full_reply
+    elif not full_reply and not interrupted:
         full_reply = "I wasn't able to complete your request. Please try again."
         yield full_reply
 
     # Only persist a clean, complete reply — never a partial/errored/interrupted one, so
     # a broken or stopped turn doesn't pollute the next turn's memory with a garbled reply.
-    if not errored and not interrupted:
+    # A workflow start persists a short synthetic note instead of the raw JSON payload, so
+    # future turns' context reconstruction reads naturally rather than replaying a JSON blob.
+    if workflow_result is not None and not interrupted:
+        await memory.append_turn(
+            request.user.schoolId, request.user.userId, request.conversationId,
+            history, request.message, _workflow_memory_note(workflow_result),
+        )
+    elif not errored and not interrupted:
         await memory.append_turn(
             request.user.schoolId,
             request.user.userId,
@@ -1142,7 +1275,11 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
 
     # Fired only after every chunk has already been yielded above — never adds to
     # perceived streaming latency (finish() itself is fire-and-forget besides).
-    trace.final_reply = full_reply
+    if workflow_result is not None:
+        trace.workflow_id = workflow_result.get("workflowId")
+        trace.final_reply = _workflow_memory_note(workflow_result)  # readable in trace logs, not the raw JSON
+    else:
+        trace.final_reply = full_reply
     trace.errored = errored
     trace.interrupted = interrupted
     await trace.finish()

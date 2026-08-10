@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     conversation_ttl_seconds: int = 1800       # sliding TTL — refreshed on every turn
     conversation_max_messages: int = 10        # last N messages (5 user/assistant turns) kept per conversation
 
+    # LangGraph workflow checkpoints (Redis) — see checkpointer.py
+    workflow_checkpoint_ttl_seconds: int = 172800   # 48h — an abandoned approval just expires
+    workflow_resume_lock_seconds: int = 30          # guards against a double-click/retry resuming twice concurrently
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

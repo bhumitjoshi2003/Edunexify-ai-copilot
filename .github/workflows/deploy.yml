@@ -77,6 +77,11 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
+            set -euo pipefail
+
+            CONTAINER=edunexify-ai-container
+            NEW_IMAGE="${{ env.IMAGE }}:${{ github.sha }}"
+
             echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
             # Shared internal network with the backend container — lets this
@@ -84,26 +89,82 @@ jobs:
             # Idempotent: whichever of the two deploy pipelines runs first creates it.
             docker network create edunexify-net 2>/dev/null || true
 
-            docker pull ${{ env.IMAGE }}:${{ github.sha }}
+            # Remember what's currently running so we can restore it if the new
+            # image fails its health check. Empty on the very first-ever deploy.
+            PREVIOUS_IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)
 
-            docker stop edunexify-ai-container || true
-            docker rm -f edunexify-ai-container || true
+            # Hard-fail here (set -e, no old container touched yet) if the new image
+            # can't even be pulled — nothing to roll back, the old container just keeps running.
+            docker pull "$NEW_IMAGE"
 
-            docker run -d \
-              --restart unless-stopped \
-              --log-driver json-file \
-              --log-opt max-size=10m \
-              --log-opt max-file=3 \
-              --health-cmd="python -c \"import urllib.request as u; u.urlopen('http://localhost:8090/health')\"" \
-              --health-interval=30s \
-              --health-timeout=5s \
-              --health-retries=3 \
-              --name edunexify-ai-container \
-              --network edunexify-net \
-              -p 127.0.0.1:8090:8090 \
-              -e DEEPSEEK_API_KEY='${{ secrets.DEEPSEEK_API_KEY }}' \
-              -e INTERNAL_SECRET='${{ secrets.AI_INTERNAL_SECRET }}' \
-              -e SPRING_BOOT_URL='${{ secrets.SPRING_BOOT_URL }}' \
-              -e REDIS_URL='${{ secrets.REDIS_URL }}' \
-              -e OPENAI_API_KEY='${{ secrets.OPENAI_API_KEY }}' \
-              ${{ env.IMAGE }}:${{ github.sha }}
+            run_container() {
+              docker run -d \
+                --restart unless-stopped \
+                --log-driver json-file \
+                --log-opt max-size=10m \
+                --log-opt max-file=3 \
+                --health-cmd="python -c \"import urllib.request as u; u.urlopen('http://localhost:8090/health')\"" \
+                --health-interval=5s \
+                --health-timeout=5s \
+                --health-retries=3 \
+                --health-start-period=15s \
+                --name "$CONTAINER" \
+                --network edunexify-net \
+                -p 127.0.0.1:8090:8090 \
+                -e DEEPSEEK_API_KEY='${{ secrets.DEEPSEEK_API_KEY }}' \
+                -e INTERNAL_SECRET='${{ secrets.AI_INTERNAL_SECRET }}' \
+                -e SPRING_BOOT_URL='${{ secrets.SPRING_BOOT_URL }}' \
+                -e REDIS_URL='${{ secrets.REDIS_URL }}' \
+                -e OPENAI_API_KEY='${{ secrets.OPENAI_API_KEY }}' \
+                "$1"
+            }
+
+            # Polls the status docker itself maintains from --health-cmd above, until it
+            # reports healthy/unhealthy or this times out. 24 x 5s = 120s, comfortably
+            # past the 15s start-period + 3x5s retry window the container is configured with.
+            wait_for_healthy() {
+              for i in $(seq 1 24); do
+                status=$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER" 2>/dev/null || echo "missing")
+                echo "[$CONTAINER] health check $i/24: $status"
+                if [ "$status" = "healthy" ]; then
+                  return 0
+                fi
+                if [ "$status" = "unhealthy" ]; then
+                  return 1
+                fi
+                sleep 5
+              done
+              return 1
+            }
+
+            docker stop "$CONTAINER" 2>/dev/null || true
+            docker rm -f "$CONTAINER" 2>/dev/null || true
+
+            # Tolerate a hard `docker run` failure here too (e.g. bad flag, port
+            # conflict) — wait_for_healthy will see "missing" and time out into the
+            # same rollback path below rather than aborting the script outright.
+            run_container "$NEW_IMAGE" || true
+
+            if wait_for_healthy; then
+              echo "Deploy succeeded: $NEW_IMAGE is healthy."
+            else
+              echo "New image failed its health check — rolling back."
+              docker logs --tail 100 "$CONTAINER" 2>&1 || true
+              docker stop "$CONTAINER" 2>/dev/null || true
+              docker rm -f "$CONTAINER" 2>/dev/null || true
+
+              if [ -n "$PREVIOUS_IMAGE" ]; then
+                echo "Restoring previous image: $PREVIOUS_IMAGE"
+                docker pull "$PREVIOUS_IMAGE" 2>/dev/null || true
+                run_container "$PREVIOUS_IMAGE" || true
+                if wait_for_healthy; then
+                  echo "Rollback succeeded: $PREVIOUS_IMAGE is healthy again."
+                else
+                  echo "Rollback ALSO failed its health check — manual intervention required."
+                fi
+              else
+                echo "No previous image found (first-ever deploy) — nothing to roll back to."
+              fi
+
+              exit 1
+            fi
