@@ -126,7 +126,14 @@ async def prepare_reminder_draft(state: FeeReminderWorkflowState, config: Runnab
         + ". Review and approve to send reminder emails using the standard reminder template."
     )
 
-    sample_names = ", ".join(d.studentName for d in state.defaulters[:5])
+    # Real per-student amounts (or "amount unknown"), not just names — mirrors the fix
+    # applied to attendance_reminder_workflow.py's identical prompt shape after E2E testing
+    # showed a bare-names example list gives the model room to invent a plausible-looking
+    # but wrong figure for a named student. None means no FeeStructure configured, not ₹0.
+    sample_examples = "; ".join(
+        f"{d.studentName} (₹{d.totalDue:,.2f})" if d.totalDue is not None else f"{d.studentName} (amount unknown)"
+        for d in state.defaulters[:5]
+    )
     amount_line = (
         f"totalAmountDue: {state.total_amount_due}"
         if state.total_amount_due is not None
@@ -135,14 +142,17 @@ async def prepare_reminder_draft(state: FeeReminderWorkflowState, config: Runnab
     prompt = (
         "Write a short, professional 2-3 sentence summary for a SCHOOL ADMIN reviewing a batch "
         "of fee reminder emails before sending. This text is shown only to the admin, never to "
-        "parents. State how many students/parents are affected, the total amount due (if known — "
-        "see below), and mention (if helpful) a couple of example names. End by inviting them to "
+        "parents. State how many students/parents are affected and the total amount due (if "
+        "known — see below). You may mention a couple of example students by name — if you "
+        "state a specific rupee amount for a named student, it MUST be exactly the figure given "
+        "for them in exampleStudents below (or omit the amount entirely if theirs is unknown); "
+        "never estimate, round to a different value, or invent one. End by inviting them to "
         "approve or reject sending.\n\n"
         f"defaulterCount: {state.defaulter_count}\n"
         f"{amount_line}\n"
         f"session: {state.session}\n"
         f"className: {state.class_name or 'all classes'}\n"
-        f"exampleNames: {sample_names}"
+        f"exampleStudents (name and their real amount due): {sample_examples}"
     )
 
     try:
@@ -243,7 +253,17 @@ async def finish(state: FeeReminderWorkflowState) -> dict:
     if state.defaulter_count == 0:
         return {"status": WorkflowStatus.NO_DEFAULTERS, **_touch(state)}
     if state.send_result:
-        status = WorkflowStatus.PARTIALLY_SENT if state.send_result.failedCount > 0 else WorkflowStatus.SENT
+        # Three-way, not two-way: failedCount > 0 alone conflates "some sent, some failed"
+        # with "every single send failed" — confirmed live during E2E testing (SMTP down ->
+        # sentCount=0/failedCount=N reported as "partially_sent", which reads as if some
+        # parents WERE reached). Mirrors the sent/failed logic AiWorkflowController.dispatch()
+        # already uses on the Spring side for the exact same distinction.
+        if state.send_result.failedCount == 0:
+            status = WorkflowStatus.SENT
+        elif state.send_result.sentCount == 0:
+            status = WorkflowStatus.FAILED
+        else:
+            status = WorkflowStatus.PARTIALLY_SENT
         return {"status": status, **_touch(state)}
     return {}
 

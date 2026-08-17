@@ -18,7 +18,7 @@ from collections import defaultdict
 
 from config import settings
 from schemas.chat import UserContext
-from tools.fees import current_academic_session
+from academic_calendar import current_academic_session
 
 
 def _pct(obtained: float | None, max_marks: float | None) -> float | None:
@@ -60,7 +60,7 @@ async def get_results_summary(
     - Cross-exam aggregates: best and weakest subject overall (by avg %)
     - Latest exam pointer (last in the returned list)
     """
-    resolved_session = session or current_academic_session()
+    resolved_session = session or await current_academic_session(access_token)
     url = f"{settings.spring_boot_url}/api/marks/student/{user.userId}/results"
 
     async with httpx.AsyncClient() as client:

@@ -113,6 +113,36 @@
     forbidden_substrings: ["is on leave", "on approved leave", "leave was approved"]
     required_substrings_any: ["don't have", "no leave", "not available", "doesn't have leave"]
 
+- id: admin_staff_attendance_today_tool_selection
+  role: ADMIN
+  test_user: admin_1
+  message: "Who is absent today?"
+  category: staff_attendance_tool_selection
+  requires: "a registered ADMIN test account (see Prerequisites)"
+  expect:
+    tools_called: [get_staff_attendance_by_date]
+    expect_citation: false
+
+- id: admin_staff_attendance_month_summary_tool_selection
+  role: ADMIN
+  test_user: admin_1
+  message: "Which teachers have the most absences this month?"
+  category: staff_attendance_tool_selection
+  requires: "a registered ADMIN test account (see Prerequisites)"
+  expect:
+    tools_called: [get_staff_attendance_month_summary]
+    expect_citation: false
+
+- id: admin_staff_attendance_not_student_attendance
+  role: ADMIN
+  test_user: admin_1
+  message: "Give me a staff attendance summary for this month."
+  category: staff_attendance_tool_selection
+  requires: "a registered ADMIN test account (see Prerequisites)"
+  expect:
+    tools_called: [get_staff_attendance_month_summary]
+    expect_citation: false
+
 - id: tenant_isolation_canary
   role: STUDENT
   test_user: student_1

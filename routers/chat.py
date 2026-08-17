@@ -23,16 +23,26 @@ import memory
 from config import settings
 from tracing import Trace, summarize_tool_result
 from schemas.chat import ChatRequest, ChatResponse, UserContext
-from tools.attendance import get_attendance_summary, current_academic_session
+from academic_calendar import current_academic_session
+from tools.attendance import get_attendance_summary
 from tools.fees import get_fee_summary
 from tools.results import get_results_summary
-from tools.teacher_attendance import get_class_attendance_summary, get_low_attendance_students
+from tools.teacher_attendance import (
+    get_class_attendance_summary,
+    get_consecutively_absent_students,
+    get_low_attendance_students,
+)
+from tools.teacher_attendance_workflows import start_teacher_attendance_reminder_workflow
 from tools.teacher_results import get_class_performance_summary
 from tools.admin_dashboard import get_school_overview, get_class_attendance_comparison
 from tools.admin_attendance import get_school_low_attendance_students
+from tools.admin_staff_attendance import get_staff_attendance_by_date, get_staff_attendance_month_summary
 from tools.admin_fees import get_fee_defaulters
 from tools.admin_fee_workflows import start_fee_reminder_workflow
+from tools.admin_attendance_workflows import start_attendance_reminder_workflow
 from tools.admin_results import get_school_performance_summary, get_class_exam_results
+from tools.leave_requests import get_pending_leave_requests, get_leave_request_details
+from tools.leave_workflows import start_leave_decision_workflow
 from tools.knowledge_base import search_knowledge_base
 
 router = APIRouter()
@@ -260,6 +270,38 @@ TEACHER_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "get_consecutively_absent_students",
+            "description": (
+                "List students in the teacher's class who have been absent for several school days "
+                "IN A ROW, with how many consecutive days and the exact dates. Call this for "
+                "questions about RECENT or ONGOING absence — 'who has been absent the last 3 days', "
+                "'which students haven't shown up this week', 'anyone missing several days in a "
+                "row'. This is NOT the same as get_low_attendance_students: that one finds students "
+                "whose cumulative percentage is low for the whole year, this one finds students who "
+                "have stopped attending recently (who may still have a good overall percentage). "
+                "Read-only — it never sends anything."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "minDays": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 60,
+                        "description": "How many consecutive school days of absence to look for. Defaults to 3.",
+                    },
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Defaults to the current session.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_class_performance_summary",
             "description": (
                 "Fetch exam performance for the teacher's own class: class average, top performers, "
@@ -281,6 +323,120 @@ TEACHER_TOOLS: list[dict] = [
                     },
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_teacher_attendance_reminder_workflow",
+            "description": (
+                "Starts the low-attendance warning review-and-approval workflow for the "
+                "teacher's own class — call this when the teacher asks to SEND, WARN, REMIND, "
+                "or NOTIFY parents of low-attendance students (an action), never for a question "
+                "about who has low attendance (use get_low_attendance_students for that). This "
+                "does NOT send any email itself: it prepares a batch and shows the teacher an "
+                "approval card; sending only happens if the teacher clicks Approve on that card. "
+                "There is no way to skip this review step, and there is no parameter to choose "
+                "recipients or a class — the workflow always fetches the full, authoritative "
+                "list of qualifying students in the teacher's own class itself. "
+                "Set criterion='CONSECUTIVE_ABSENCE' when the teacher is talking about students "
+                "absent several days IN A ROW ('absent the last 3 days', 'missing all week'); "
+                "leave it as 'BELOW_THRESHOLD' when they mean a cumulative percentage ('below "
+                "70%', 'poor attendance this year')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Defaults to the current session.",
+                    },
+                    "criterion": {
+                        "type": "string",
+                        "enum": ["BELOW_THRESHOLD", "CONSECUTIVE_ABSENCE"],
+                        "description": (
+                            "How to pick students. 'BELOW_THRESHOLD' = cumulative attendance under "
+                            "`threshold`%. 'CONSECUTIVE_ABSENCE' = absent the last `minConsecutiveDays` "
+                            "school days in a row. Defaults to BELOW_THRESHOLD."
+                        ),
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "Attendance percentage cutoff, used only with criterion='BELOW_THRESHOLD'. Defaults to 75.",
+                    },
+                    "minConsecutiveDays": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 60,
+                        "description": "Consecutive absent school days required, used only with criterion='CONSECUTIVE_ABSENCE'. Defaults to 3.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pending_leave_requests",
+            "description": (
+                "List leave requests still awaiting a decision, oldest first, each with its "
+                "leaveId, student, date and reason. Call this when asked who has applied for "
+                "leave, what leave is pending, or to review leave requests. READ-ONLY — it never "
+                "approves or rejects anything. Always call this (or get_leave_request_details) "
+                "before starting a decision, so you act on real leaveIds rather than guessing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "studentId": {"type": "string", "description": "Restrict to one student's requests. Omit for all."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max requests to return. Defaults to 25."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_leave_request_details",
+            "description": (
+                "Fetch specific leave requests by their leaveId, showing each one's CURRENT "
+                "status (PENDING, APPROVED or REJECTED). Use this to confirm what a request is "
+                "before acting on it, or to check what happened to one. READ-ONLY."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "leaveIds": {"type": "array", "items": {"type": "integer"}, "description": "The leaveId values to look up."},
+                },
+                "required": ["leaveIds"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_leave_decision_workflow",
+            "description": (
+                "Starts the review-and-approval workflow for APPROVING or REJECTING specific "
+                "leave requests — call this when the user asks to approve, reject, grant, deny or "
+                "decline leave, including for requests discussed earlier in the conversation "
+                "(e.g. 'approve the first two', 'reject Riley\'s'). This does NOT change anything "
+                "itself: it prepares the decision and shows an approval card; the change only "
+                "happens if the user clicks Approve on that card. "
+                "You MUST pass real leaveId values obtained from get_pending_leave_requests or "
+                "get_leave_request_details in this conversation — never invent, guess, or "
+                "increment an id. If you do not have real ids yet, call a read tool first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "decision": {"type": "string", "enum": ["APPROVED", "REJECTED"], "description": "What to do with the listed leave requests."},
+                    "leaveIds": {"type": "array", "items": {"type": "integer"}, "description": "leaveId values to act on, from a read tool in this conversation."},
+                },
+                "required": ["decision", "leaveIds"],
             },
         },
     },
@@ -366,6 +522,51 @@ ADMIN_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "get_staff_attendance_by_date",
+            "description": (
+                "Fetch every teacher's attendance STATUS for one date (default: today), grouped "
+                "into presentTeachers, lateTeachers, absentTeachers, halfDayTeachers, and "
+                "onLeaveTeachers, each with names. This is STAFF/TEACHER attendance (did teachers "
+                "check in), never student attendance. Call this when the admin asks who is absent "
+                "today, who was late today, which teachers are on leave today, or asks about staff "
+                "attendance for a specific date."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Date in YYYY-MM-DD format. Omit for today (resolved in the school's own timezone).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_staff_attendance_month_summary",
+            "description": (
+                "Fetch whole-school STAFF/TEACHER attendance totals for one month (present/late/"
+                "absent/half-day/on-leave day counts, on-time percentage), plus a ranked list of "
+                "teachers with the most absences that month. Call this when the admin asks for a "
+                "staff attendance summary for a month, or asks which teachers have the most "
+                "absences/lates. Defaults to the current month if not specified."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "month": {"type": "integer", "minimum": 1, "maximum": 12, "description": "1-12. Defaults to the current month."},
+                    "year": {"type": "integer", "description": "e.g. 2026. Defaults to the current year."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_fee_defaulters",
             "description": (
                 "Fetch students with pending/overdue fees: total count, total amount due, a class-wise "
@@ -411,6 +612,40 @@ ADMIN_TOOLS: list[dict] = [
                     "className": {
                         "type": "string",
                         "description": "Restrict the batch to one class, e.g. '10'. Omit for the whole school.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_attendance_reminder_workflow",
+            "description": (
+                "Starts the low-attendance warning review-and-approval workflow — call this when "
+                "the admin asks to SEND, WARN, REMIND, or NOTIFY parents of students with low "
+                "attendance (an action), never for a question about who has low attendance (use "
+                "get_school_low_attendance_students for that). This does NOT send any email "
+                "itself: it prepares a batch and shows the admin an approval card; sending only "
+                "happens if the admin clicks Approve on that card. There is no way to skip this "
+                "review step, and there is no parameter to choose recipients — the workflow always "
+                "fetches the full, authoritative list of currently-below-threshold students itself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "Academic session in YYYY-YYYY format. Defaults to the current session.",
+                    },
+                    "className": {
+                        "type": "string",
+                        "description": "Restrict the batch to one class, e.g. '10'. Omit for the whole school.",
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "Attendance percentage cutoff. Students below this are included. Defaults to 75.",
                     },
                 },
                 "required": [],
@@ -476,8 +711,83 @@ ADMIN_TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pending_leave_requests",
+            "description": (
+                "List leave requests still awaiting a decision, oldest first, each with its "
+                "leaveId, student, date and reason. Call this when asked who has applied for "
+                "leave, what leave is pending, or to review leave requests. READ-ONLY — it never "
+                "approves or rejects anything. Always call this (or get_leave_request_details) "
+                "before starting a decision, so you act on real leaveIds rather than guessing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "studentId": {"type": "string", "description": "Restrict to one student's requests. Omit for all."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max requests to return. Defaults to 25."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_leave_request_details",
+            "description": (
+                "Fetch specific leave requests by their leaveId, showing each one's CURRENT "
+                "status (PENDING, APPROVED or REJECTED). Use this to confirm what a request is "
+                "before acting on it, or to check what happened to one. READ-ONLY."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "leaveIds": {"type": "array", "items": {"type": "integer"}, "description": "The leaveId values to look up."},
+                },
+                "required": ["leaveIds"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_leave_decision_workflow",
+            "description": (
+                "Starts the review-and-approval workflow for APPROVING or REJECTING specific "
+                "leave requests — call this when the user asks to approve, reject, grant, deny or "
+                "decline leave, including for requests discussed earlier in the conversation "
+                "(e.g. 'approve the first two', 'reject Riley\'s'). This does NOT change anything "
+                "itself: it prepares the decision and shows an approval card; the change only "
+                "happens if the user clicks Approve on that card. "
+                "You MUST pass real leaveId values obtained from get_pending_leave_requests or "
+                "get_leave_request_details in this conversation — never invent, guess, or "
+                "increment an id. If you do not have real ids yet, call a read tool first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "decision": {"type": "string", "enum": ["APPROVED", "REJECTED"], "description": "What to do with the listed leave requests."},
+                    "leaveIds": {"type": "array", "items": {"type": "integer"}, "description": "leaveId values to act on, from a read tool in this conversation."},
+                },
+                "required": ["decision", "leaveIds"],
+            },
+        },
+    },
     _SEARCH_KNOWLEDGE_BASE_TOOL,
 ]
+
+# Defense-in-depth for _execute_tool: derived (never hand-duplicated) from the same
+# STUDENT_TOOLS/TEACHER_TOOLS/ADMIN_TOOLS lists used to build each role's schema — so it can't
+# drift out of sync with what's actually offered to the model. Without this, the only thing
+# stopping a role from executing a tool meant for a different role was the model never being
+# handed that tool's schema; there was no server-side check in the dispatch layer itself.
+_TOOL_NAMES_BY_ROLE: dict[str, set[str]] = {
+    "STUDENT": {t["function"]["name"] for t in STUDENT_TOOLS},
+    "TEACHER": {t["function"]["name"] for t in TEACHER_TOOLS},
+    "ADMIN": {t["function"]["name"] for t in ADMIN_TOOLS},
+}
 
 
 _STUDENT_PROMPT_BODY = """## Available tools
@@ -534,11 +844,15 @@ Do NOT call any tool for:
 
 _TEACHER_PROMPT_BODY = """## Available tools
 - get_class_attendance_summary — use when the teacher asks how their class's attendance is doing overall (averages, how many students are below 75%).
-- get_low_attendance_students — use when the teacher asks WHICH students have low/poor attendance, are missing too many days, or need attention on attendance.
+- get_low_attendance_students — use when the teacher asks WHICH students have low/poor CUMULATIVE attendance for the year (an INFORMATION request — never sends anything).
+- get_consecutively_absent_students — use when the teacher asks about RECENT, ONGOING absence: "absent the last 3 days", "hasn't shown up this week", "missing several days in a row" (an INFORMATION request — never sends anything).
+- start_teacher_attendance_reminder_workflow — use when the teacher asks to SEND, WARN, REMIND, or NOTIFY parents about EITHER pattern (an ACTION request). See "Attendance reminders — information vs. action" below before choosing between these.
 - get_class_performance_summary — use when the teacher asks how their class performed in an exam, which students need academic attention, or which subjects students are struggling with.
+- get_pending_leave_requests / get_leave_request_details — use when the teacher asks who has applied for leave or what a request says (INFORMATION, never changes anything).
+- start_leave_decision_workflow — use when the teacher asks to APPROVE or REJECT leave requests (an ACTION). Requires real leaveIds from a read tool first.
 - search_knowledge_base — use when the teacher asks about a school POLICY, RULE, or GUIDELINE (e.g. leave policy, attendance policy, exam guidelines, handbook) rather than live class data.
 
-The three class-data tools are automatically scoped to the teacher's own assigned class — there is no className argument, so you never need to ask the teacher which class they mean. search_knowledge_base is school-wide, not class-scoped.
+All class-data tools are automatically scoped to the teacher's own assigned class — there is no className argument, so you never need to ask the teacher which class they mean. search_knowledge_base is school-wide, not class-scoped.
 
 You may call multiple tools in a single turn if the user asks about more than one topic (e.g. "how's my class doing overall" could warrant both attendance and performance).
 
@@ -559,12 +873,93 @@ If the user asks something ambiguous like "which students need attention", consi
 - List each student by name with their attendance percentage, lowest first.
 - If studentsBelowThreshold is 0, say clearly that no students are below the threshold — that's good news, don't imply a problem exists.
 
+## When showing consecutively-absent students
+- Lead with how many students, and name each one with their consecutiveAbsentDays — that number is the point of the question.
+- The days are SCHOOL days the class actually had attendance marked, not calendar days; if you mention dates, use the absentDates the tool returned rather than counting back from today yourself.
+- If studentsFound is 0, say plainly that nobody has been absent that many days in a row.
+- Their attendancePercentage is included for context — do not present it as the reason they were flagged.
+
 ## When showing class performance data
 - Lead with the exam name and class average percentage.
 - Name the students in studentsNeedingAttention specifically, not just "some students".
 - List subjectPerformance from weakest to strongest — call out the weakest subject explicitly since that's usually the most actionable insight.
 - If noExamsYet is true, say clearly that no exams are configured yet — do NOT say "unable to fetch".
 - If the tool returns an "availableExams" list (exam name not found), tell the teacher which exam names actually exist instead of failing silently.
+
+## Two different attendance patterns — pick the right one
+These answer different questions and routinely return DIFFERENT students. Read which the teacher means:
+- CUMULATIVE shortfall — "below 70%", "poor attendance this year", "low attendance overall".
+  Read-only tool: get_low_attendance_students. Workflow criterion: BELOW_THRESHOLD (with threshold).
+- RECENT consecutive absence — "absent the last 3 days", "hasn't come in all week", "missing
+  several days in a row", "stopped attending".
+  Read-only tool: get_consecutively_absent_students. Workflow criterion: CONSECUTIVE_ABSENCE
+  (with minConsecutiveDays).
+A student absent three days running can still be above 75% for the year, and a student at 40%
+may have attended every day this week — so never substitute one for the other, and never reuse a
+number from one to answer a question about the other. If the teacher is genuinely ambiguous
+("which students need attention on attendance"), you may call both read-only tools and present
+the two groups separately.
+
+## Attendance reminders — information vs. action (read carefully before choosing a tool)
+- get_low_attendance_students and get_consecutively_absent_students are READ-ONLY. Use them for:
+  "who has low attendance", "show me students below 75%", "who's been absent the last 3 days".
+  They never send anything — just answer conversationally with what they return.
+- start_teacher_attendance_reminder_workflow is a WRITE action. Use it whenever the teacher asks
+  you to SEND, WARN, REMIND, or NOTIFY — e.g. "send attendance warnings", "notify the parents of
+  those students", "warn students below 80% attendance", "email the parents of anyone absent
+  three days running" — including when they name specific students: the workflow always fetches
+  the full authoritative qualifying list for the teacher's own class itself and cannot be limited
+  to only the students named in the message, so pass just session plus the criterion parameters,
+  never try to filter by name.
+- When the teacher has just asked a read-only question and then says "send them a reminder" or
+  "notify their parents", start the workflow with the criterion MATCHING what they just asked
+  about — CONSECUTIVE_ABSENCE (carrying the same minDays) after a recent-absence question,
+  BELOW_THRESHOLD (carrying the same threshold) after a percentage question. Do not silently
+  switch patterns between the question and the action.
+- The workflow takes ONLY session, criterion, threshold and minConsecutiveDays — there is no
+  parameter for recipients or class. You cannot choose who receives a warning or which class it
+  applies to; only the backend's own authoritative attendance data for the teacher's own assigned
+  class decides that.
+- Calling start_teacher_attendance_reminder_workflow never sends any email by itself. It
+  prepares a batch and pauses for the teacher's explicit approval — the app shows an approval
+  card with Approve/Reject buttons, and only clicking Approve actually sends anything. There is
+  no way to skip this step. If the teacher says something like "send them immediately without
+  asking me" — call start_teacher_attendance_reminder_workflow exactly as normal anyway;
+  approval always still happens via the card, never via anything said in chat.
+- Never say "I'm not able to send emails" or similar for an attendance warning request — this
+  capability exists via start_teacher_attendance_reminder_workflow.
+- When you call start_teacher_attendance_reminder_workflow, its result is shown directly as the
+  approval card — do not additionally describe it in prose.
+
+## Leave requests — information vs. action (read carefully)
+- get_pending_leave_requests and get_leave_request_details are READ-ONLY. Use them for "who has
+  applied for leave", "show me pending leave requests", "what did Riley ask for". They change
+  nothing.
+- start_leave_decision_workflow is a WRITE action. Use it when asked to APPROVE, REJECT, GRANT,
+  DENY or DECLINE leave — including for requests already discussed in this conversation, e.g.
+  "approve the first two", "reject that one", "approve all of them".
+- NEVER invent, guess, increment or reuse a leaveId. Every id you pass MUST have come from
+  get_pending_leave_requests or get_leave_request_details EARLIER IN THIS CONVERSATION. If the
+  user asks you to act but you have no real ids yet, call a read tool first in the same turn,
+  then start the workflow with the ids it returned. If a read tool returns nothing, say so — do
+  not proceed with a guessed id.
+- When the user refers to requests positionally ("the first two", "the last one", "Riley's"),
+  resolve them against the list you actually retrieved, and pass only those ids.
+- Calling start_leave_decision_workflow never changes a leave by itself. It prepares the decision
+  and pauses for explicit human approval — the app shows a card with Approve/Reject, and only
+  clicking Approve applies anything. There is no way to skip this. If the user says "just do it
+  without asking" — call the tool exactly as normal anyway; approval always still happens on the
+  card, never via anything said in chat.
+- Requests that someone else already decided are shown on the card but are NOT changed. If the
+  tool result's actionableCount is lower than leaveCount, mention that some were already decided.
+- When you call start_leave_decision_workflow, its result IS the approval card — do not describe
+  it again in prose.
+
+## When showing leave requests
+- Lead with how many are awaiting a decision. List each with the student's name, the date, and
+  the reason — those are what a reviewer needs to decide.
+- Give the dates exactly as returned; never reformat a date into a different calendar day.
+- If a request's status is not PENDING, say so plainly rather than implying it still needs action.
 
 ## When answering from the knowledge base (search_knowledge_base)
 - Treat the returned chunks as the ONLY source for policy content — never add typical/generic school-policy knowledge from general training, even if it sounds plausible or is commonly true elsewhere.
@@ -586,10 +981,15 @@ _ADMIN_PROMPT_BODY = """## Available tools
 - get_school_overview — use for an overall school summary or general status check (students, teachers, fees this month, overdue count, today's attendance, pending leaves).
 - get_class_attendance_comparison — use when the admin asks which classes have the best/worst attendance, or wants a class-by-class breakdown. Defaults to the full session; only pass type='month' if they explicitly say "this month".
 - get_school_low_attendance_students — use when the admin asks WHICH specific students (not just which classes) have low attendance, school-wide. Returns attendance PERCENTAGES only — never exam data.
+- start_attendance_reminder_workflow — use when the admin asks to SEND, WARN, REMIND, or NOTIFY parents of low-attendance students (an ACTION request). See "Attendance reminders — information vs. action" below before choosing between these two.
+- get_staff_attendance_by_date — use when the admin asks who is absent/late/on leave TODAY (or on a specific date), for STAFF/TEACHERS (not students). READ-ONLY.
+- get_staff_attendance_month_summary — use when the admin asks for a staff attendance summary for a month, or which teachers have the most absences/lates this month. READ-ONLY.
 - get_fee_defaulters — use when the admin asks to SEE, COUNT, or LIST fee defaulters (an INFORMATION request — never sends anything).
 - start_fee_reminder_workflow — use when the admin asks to SEND, REMIND, or NOTIFY fee defaulters (an ACTION request). See "Fee reminders — information vs. action" below before choosing between these two.
 - get_school_performance_summary — use for class-level exam performance (best/worst class, weakest subjects) AND for "which student is weakest/strongest academically" when no specific class is named (see schoolWideTopPerformers / schoolWideNeedingAttention).
 - get_class_exam_results — the ONLY tool with individual exam scores for a named class (top scorer, lowest scorer, full ranked list). Use whenever the admin names a specific class and asks about individual student performance in it (e.g. "who scored lowest in Class 2's exam").
+- get_pending_leave_requests / get_leave_request_details — use when the admin asks who has applied for leave or what a request says (INFORMATION, never changes anything).
+- start_leave_decision_workflow — use when the admin asks to APPROVE or REJECT leave requests (an ACTION). Requires real leaveIds from a read tool first.
 - search_knowledge_base — use when the admin asks about a school POLICY, RULE, or GUIDELINE (e.g. leave policy, attendance policy, fee policy, exam guidelines, handbook) rather than live structured data.
 
 For broad questions (e.g. "give me an overall school summary"), call multiple relevant tools in the same turn and present the results in sections — don't limit yourself to one.
@@ -635,6 +1035,25 @@ These are DIFFERENT metrics from DIFFERENT tools — never substitute one for an
 - If truncated is true, mention there are more below the threshold than shown (studentsBelowThreshold gives the real total).
 - If studentsBelowThreshold is 0, say clearly that's good news — don't imply a problem.
 
+## When showing staff/teacher attendance data (get_staff_attendance_by_date, get_staff_attendance_month_summary)
+- This is STAFF/TEACHER attendance — completely separate from student attendance
+  (get_school_low_attendance_students, get_class_attendance_comparison) and from student LEAVE
+  (get_pending_leave_requests). Never mix these up or answer a staff-attendance question using
+  student data or vice versa.
+- get_staff_attendance_by_date: answer "who is absent" from absentTeachers, "who was late" from
+  lateTeachers, "who is on leave" from onLeaveTeachers — list them by name. If the "note" field is
+  present, relay it plainly (an empty result on a given date usually means it's a non-working day,
+  not that everyone was present) — do NOT say "no one was absent" or "everyone was present" in
+  that case.
+- get_staff_attendance_month_summary: lead with the school-wide totals (presentDays, lateDays,
+  absentDays, halfDayDays, onLeaveDays, onTimePercentage) if asked for a general summary. For
+  "which teachers have the most absences", list teachersWithMostAbsences by name with their
+  absentDays count — if a teacher has 0 absences don't call special attention to them. If
+  truncated is true, mention there are more teachers below the ones shown.
+- Both tools are READ-ONLY — they never mark, change, or approve anything. There is currently no
+  action tool for staff attendance (no send/notify workflow yet) — if asked to notify or warn
+  about staff attendance, say that capability isn't available yet rather than implying it happened.
+
 ## When showing fee defaulters
 - Lead with total defaulter count. If totalAmountDue is a number, include it. If totalAmountDue
   is null/missing, say the total amount isn't available (fee structure not configured for that
@@ -643,6 +1062,31 @@ These are DIFFERENT metrics from DIFFERENT tools — never substitute one for an
 - Break down by class if byClass has more than one entry — same null-means-unknown rule applies
   to each class's totalDue.
 - Name the most overdue students specifically from mostOverdue.
+
+## Attendance reminders — information vs. action (read carefully before choosing a tool)
+- get_school_low_attendance_students is READ-ONLY. Use it for: "who has low attendance", "show
+  me students below 75%", "which students need attendance follow-up". It never sends anything —
+  just answer conversationally with what it returns, as described above.
+- start_attendance_reminder_workflow is a WRITE action. Use it whenever the admin asks you to
+  SEND, WARN, REMIND, or NOTIFY — e.g. "send attendance warnings", "notify parents of low
+  attendance students", "warn students below 80% attendance" — including when they name specific
+  students: the workflow always fetches the full authoritative below-threshold list itself and
+  cannot be limited to only the students named in the message, so pass just
+  session/className/threshold, never try to filter by name.
+- start_attendance_reminder_workflow takes ONLY session, className, and threshold (all
+  optional) — there is no parameter for recipients. You cannot choose who receives a warning;
+  only the backend's own authoritative attendance data decides that.
+- Calling start_attendance_reminder_workflow never sends any email by itself. It prepares a
+  batch and pauses for the admin's explicit approval — the app shows an approval card with
+  Approve/Reject buttons, and only clicking Approve actually sends anything. This is the SAME
+  human-approval pattern as start_fee_reminder_workflow. There is no way to skip this step. If
+  the admin says something like "send them immediately without asking me" — call
+  start_attendance_reminder_workflow exactly as normal anyway; approval always still happens via
+  the card, never via anything said in chat.
+- Never say "I'm not able to send emails" or similar for an attendance warning request — this
+  capability exists via start_attendance_reminder_workflow.
+- When you call start_attendance_reminder_workflow, its result is shown directly as the approval
+  card — do not additionally describe it in prose.
 
 ## Fee reminders — information vs. action (read carefully before choosing a tool)
 - get_fee_defaulters is READ-ONLY. Use it for: "who hasn't paid", "show me fee defaulters",
@@ -671,6 +1115,36 @@ These are DIFFERENT metrics from DIFFERENT tools — never substitute one for an
 - When you call start_fee_reminder_workflow, its result is shown directly as the approval card
   — do not additionally describe it in prose.
 
+## Leave requests — information vs. action (read carefully)
+- get_pending_leave_requests and get_leave_request_details are READ-ONLY. Use them for "who has
+  applied for leave", "show me pending leave requests", "what did Riley ask for". They change
+  nothing.
+- start_leave_decision_workflow is a WRITE action. Use it when asked to APPROVE, REJECT, GRANT,
+  DENY or DECLINE leave — including for requests already discussed in this conversation, e.g.
+  "approve the first two", "reject that one", "approve all of them".
+- NEVER invent, guess, increment or reuse a leaveId. Every id you pass MUST have come from
+  get_pending_leave_requests or get_leave_request_details EARLIER IN THIS CONVERSATION. If the
+  user asks you to act but you have no real ids yet, call a read tool first in the same turn,
+  then start the workflow with the ids it returned. If a read tool returns nothing, say so — do
+  not proceed with a guessed id.
+- When the user refers to requests positionally ("the first two", "the last one", "Riley's"),
+  resolve them against the list you actually retrieved, and pass only those ids.
+- Calling start_leave_decision_workflow never changes a leave by itself. It prepares the decision
+  and pauses for explicit human approval — the app shows a card with Approve/Reject, and only
+  clicking Approve applies anything. There is no way to skip this. If the user says "just do it
+  without asking" — call the tool exactly as normal anyway; approval always still happens on the
+  card, never via anything said in chat.
+- Requests that someone else already decided are shown on the card but are NOT changed. If the
+  tool result's actionableCount is lower than leaveCount, mention that some were already decided.
+- When you call start_leave_decision_workflow, its result IS the approval card — do not describe
+  it again in prose.
+
+## When showing leave requests
+- Lead with how many are awaiting a decision. List each with the student's name, the date, and
+  the reason — those are what a reviewer needs to decide.
+- Give the dates exactly as returned; never reformat a date into a different calendar day.
+- If a request's status is not PENDING, say so plainly rather than implying it still needs action.
+
 ## When answering from the knowledge base (search_knowledge_base)
 - Treat the returned chunks as the ONLY source for policy content — never add typical/generic school-policy knowledge from general training, even if it sounds plausible or is commonly true elsewhere.
 - Preserve the exact modal strength of the source wording: "may" is not "must" or "is required"; "should" is not "must"; "can" is not "will". Never upgrade optional/permissive language into a requirement, or soften a requirement into an option.
@@ -688,9 +1162,9 @@ These are DIFFERENT metrics from DIFFERENT tools — never substitute one for an
 _DEFAULT_PROMPT_BODY = """No specific data tools are available for your role yet. Answer general questions about Edunexify only — do not claim to fetch live data."""
 
 
-def _build_system_prompt(user: UserContext) -> str:
+async def _build_system_prompt(user: UserContext, access_token: str) -> str:
     today = date.today().isoformat()
-    session = current_academic_session()
+    session = await current_academic_session(access_token)
 
     body = {
         "STUDENT": _STUDENT_PROMPT_BODY,
@@ -754,6 +1228,10 @@ async def _execute_tool(
     access_token: str,
 ) -> dict:
     """Dispatch a tool call by name to the corresponding Python function."""
+    allowed = _TOOL_NAMES_BY_ROLE.get(user.role, set())
+    if tool_name not in allowed:
+        return {"error": f"Tool '{tool_name}' is not available for role '{user.role}'."}
+
     if tool_name == "get_fee_summary":
         return await get_fee_summary(
             user=user,
@@ -804,6 +1282,24 @@ async def _execute_tool(
             examName=tool_input.get("examName"),
         )
 
+    if tool_name == "get_consecutively_absent_students":
+        return await get_consecutively_absent_students(
+            user=user,
+            access_token=access_token,
+            minDays=tool_input.get("minDays", 3),
+            session=tool_input.get("session"),
+        )
+
+    if tool_name == "start_teacher_attendance_reminder_workflow":
+        return await start_teacher_attendance_reminder_workflow(
+            user=user,
+            access_token=access_token,
+            session=tool_input.get("session"),
+            threshold=tool_input.get("threshold", 75.0),
+            criterion=tool_input.get("criterion", "BELOW_THRESHOLD"),
+            minConsecutiveDays=tool_input.get("minConsecutiveDays"),
+        )
+
     if tool_name == "get_school_overview":
         return await get_school_overview(user=user, access_token=access_token)
 
@@ -821,6 +1317,30 @@ async def _execute_tool(
             access_token=access_token,
             threshold=tool_input.get("threshold", 75.0),
             session=tool_input.get("session"),
+        )
+
+    if tool_name == "start_attendance_reminder_workflow":
+        return await start_attendance_reminder_workflow(
+            user=user,
+            access_token=access_token,
+            session=tool_input.get("session"),
+            className=tool_input.get("className"),
+            threshold=tool_input.get("threshold", 75.0),
+        )
+
+    if tool_name == "get_staff_attendance_by_date":
+        return await get_staff_attendance_by_date(
+            user=user,
+            access_token=access_token,
+            date=tool_input.get("date"),
+        )
+
+    if tool_name == "get_staff_attendance_month_summary":
+        return await get_staff_attendance_month_summary(
+            user=user,
+            access_token=access_token,
+            month=tool_input.get("month"),
+            year=tool_input.get("year"),
         )
 
     if tool_name == "get_fee_defaulters":
@@ -853,6 +1373,29 @@ async def _execute_tool(
             className=tool_input["className"],
             session=tool_input.get("session"),
             examName=tool_input.get("examName"),
+        )
+
+    if tool_name == "get_pending_leave_requests":
+        return await get_pending_leave_requests(
+            user=user,
+            access_token=access_token,
+            studentId=tool_input.get("studentId"),
+            limit=tool_input.get("limit", 25),
+        )
+
+    if tool_name == "get_leave_request_details":
+        return await get_leave_request_details(
+            user=user,
+            access_token=access_token,
+            leaveIds=tool_input.get("leaveIds") or [],
+        )
+
+    if tool_name == "start_leave_decision_workflow":
+        return await start_leave_decision_workflow(
+            user=user,
+            access_token=access_token,
+            decision=tool_input.get("decision", ""),
+            leaveIds=tool_input.get("leaveIds") or [],
         )
 
     if tool_name == "search_knowledge_base":
@@ -893,28 +1436,72 @@ async def _execute_tool_traced(
     return result
 
 
-# Tools that don't just answer a question — they start the fee-reminder LangGraph workflow
-# (see tools/admin_fee_workflows.py). When one of these is called and actually produces a
-# workflow, both /chat and /chat/stream short-circuit: skip the usual follow-up turn where
-# the model would draft a sentence describing the result, and return the tool's own result
-# directly as structured data instead, so Angular can render the existing approval card.
-# This is what keeps "the AI must never autonomously send anything" true by construction —
-# the model's role ends at deciding whether to call this tool; nothing here, or afterward,
-# ever calls the approve endpoint.
-_WORKFLOW_STARTING_TOOLS = {"start_fee_reminder_workflow"}
+# Tools that don't just answer a question — they start a LangGraph workflow (see
+# tools/admin_fee_workflows.py, tools/admin_attendance_workflows.py). When one of these is
+# called and actually produces a workflow, both /chat and /chat/stream short-circuit: skip
+# the usual follow-up turn where the model would draft a sentence describing the result, and
+# return the tool's own result directly as structured data instead, so Angular can render the
+# matching approval card. This is what keeps "the AI must never autonomously send anything"
+# true by construction — the model's role ends at deciding whether to call this tool; nothing
+# here, or afterward, ever calls the approve endpoint.
+# Which card each workflow-starting tool produces. This used to be inferred by sniffing for
+# disjoint fields in the result (defaulterCount vs a top-level className vs neither), which was
+# already subtle at three workflows and became genuinely fragile at four — the leave result also
+# carries a top-level className, so the old ordering would have misrouted it to the teacher
+# attendance card. The triggering tool name is known at both capture sites, so the mapping is now
+# explicit and the result carries its own kind.
+_WORKFLOW_TOOL_KINDS = {
+    "start_fee_reminder_workflow": "fee_reminder_workflow",
+    "start_attendance_reminder_workflow": "attendance_reminder_workflow",
+    "start_teacher_attendance_reminder_workflow": "teacher_attendance_reminder_workflow",
+    "start_leave_decision_workflow": "leave_decision_workflow",
+}
+_WORKFLOW_STARTING_TOOLS = set(_WORKFLOW_TOOL_KINDS)
 
 
 def _as_workflow_result(tool_name: str, tool_output) -> dict | None:
-    if tool_name not in _WORKFLOW_STARTING_TOOLS:
+    if tool_name not in _WORKFLOW_TOOL_KINDS:
         return None
     if not isinstance(tool_output, dict) or not tool_output.get("workflowId"):
         return None  # tool errored (e.g. access denied, Spring unreachable) — let the model explain it normally
-    return tool_output
+    return {**tool_output, "kind": _WORKFLOW_TOOL_KINDS[tool_name]}
+
+
+def _workflow_kind(result: dict) -> str:
+    return result.get("kind") or "attendance_reminder_workflow"
 
 
 def _workflow_memory_note(result: dict) -> str:
-    count = result.get("defaulterCount", 0)
-    return f"[Started a fee reminder review for {count} student(s) — awaiting the admin's approval in the approval card.]"
+    # An empty batch (no_defaulters / no_low_attendance_students) routes straight to finish()
+    # without ever pausing at the approval interrupt — confirmed live during E2E testing, where
+    # the unconditional "awaiting approval" wording was saved into conversation memory even
+    # though there was nothing to approve, which could mislead a follow-up turn (e.g. an admin
+    # asking "did that send?" after a batch that never had anyone to send to).
+    kind = _workflow_kind(result)
+
+    if kind == "leave_decision_workflow":
+        if result.get("status") == "no_actionable_requests":
+            return ("[Looked up those leave requests — none of them are still awaiting a decision, "
+                    "so no approval card was created.]")
+        verb = "approve" if result.get("decision") == "APPROVED" else "reject"
+        return (f"[Prepared a request to {verb} {result.get('actionableCount', 0)} leave request(s) "
+                "— awaiting approval in the approval card. Nothing has changed yet.]")
+
+    if kind == "fee_reminder_workflow":
+        count = result.get("defaulterCount", 0)
+        if result.get("status") == "no_defaulters":
+            return "[Checked for fee defaulters — none found, so no reminder batch was started.]"
+        return f"[Started a fee reminder review for {count} student(s) — awaiting the admin's approval in the approval card.]"
+
+    count = result.get("studentCount", 0)
+    if kind == "teacher_attendance_reminder_workflow":
+        if result.get("status") == "no_low_attendance_students":
+            return "[Checked for low-attendance students in your class — none found, so no reminder batch was started.]"
+        return f"[Started an attendance reminder review for {count} student(s) in your class — awaiting your approval in the approval card.]"
+
+    if result.get("status") == "no_low_attendance_students":
+        return "[Checked for low-attendance students — none found, so no reminder batch was started.]"
+    return f"[Started an attendance reminder review for {count} student(s) — awaiting the admin's approval in the approval card.]"
 
 
 # ─── Main endpoint ────────────────────────────────────────────────────────────
@@ -936,7 +1523,7 @@ async def chat(
     # OpenAI format: system message is the first entry in the messages list,
     # not a separate top-level parameter like in Anthropic's API.
     messages: list[dict] = [
-        {"role": "system", "content": _build_system_prompt(request.user)},
+        {"role": "system", "content": await _build_system_prompt(request.user, request.accessToken)},
         *history,
         {"role": "user", "content": request.message},
     ]
@@ -1076,7 +1663,7 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
     )
 
     messages: list[dict] = [
-        {"role": "system", "content": _build_system_prompt(request.user)},
+        {"role": "system", "content": await _build_system_prompt(request.user, request.accessToken)},
         *history,
         {"role": "user", "content": request.message},
     ]
@@ -1248,7 +1835,7 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
         # checking `kind`, falling back to plain text if that fails — see
         # ai-copilot.component.ts. This is the entire "protocol extension": no sentinels,
         # no header/trailer tricks, the transport (chunked text/plain) is unchanged.
-        full_reply = json.dumps({"kind": "fee_reminder_workflow", **workflow_result})
+        full_reply = json.dumps({"kind": _workflow_kind(workflow_result), **workflow_result})
         yield full_reply
     elif not full_reply and not interrupted:
         full_reply = "I wasn't able to complete your request. Please try again."

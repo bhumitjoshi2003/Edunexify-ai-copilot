@@ -8,7 +8,14 @@ from fastapi import FastAPI
 
 import checkpointer
 import memory
-from routers import chat, knowledge_base, workflows_fee_reminders
+from routers import (
+    chat,
+    knowledge_base,
+    workflows_attendance_reminders,
+    workflows_fee_reminders,
+    workflows_teacher_attendance_reminders,
+    workflows_leave_decisions,
+)
 
 app = FastAPI(
     title="Edunexify AI Service",
@@ -22,6 +29,9 @@ app = FastAPI(
 app.include_router(chat.router)
 app.include_router(knowledge_base.router)
 app.include_router(workflows_fee_reminders.router)
+app.include_router(workflows_attendance_reminders.router)
+app.include_router(workflows_teacher_attendance_reminders.router)
+app.include_router(workflows_leave_decisions.router)
 
 
 @app.get("/health")

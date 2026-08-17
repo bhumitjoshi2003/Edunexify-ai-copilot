@@ -12,24 +12,11 @@ Because Spring Boot's existing auth checks (student can only see own data,
 schoolId scoping) are tied to the JWT. Forwarding it means we get all those
 guarantees for free without duplicating any logic here.
 """
-from datetime import date
-
 import httpx
 
+from academic_calendar import current_academic_session
 from config import settings
 from schemas.chat import UserContext
-
-
-def current_academic_session() -> str:
-    """
-    Derive the current academic session string (e.g. '2026-2027').
-    Edunexify academic years start in April (month 4).
-    August 2026 → April 2026 is the start → session is '2026-2027'.
-    """
-    today = date.today()
-    if today.month >= 4:
-        return f"{today.year}-{today.year + 1}"
-    return f"{today.year - 1}-{today.year}"
 
 
 async def get_attendance_summary(
@@ -55,7 +42,7 @@ async def get_attendance_summary(
 
     params: dict = {"type": type}
     if type == "year":
-        params["session"] = session or current_academic_session()
+        params["session"] = session or await current_academic_session(access_token)
     elif type == "month":
         if month is None or year is None:
             return {"error": "month and year are required when type is 'month'"}

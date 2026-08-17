@@ -19,6 +19,7 @@ recipient list. See routers/chat.py's system prompt for the corresponding instru
 """
 import httpx
 
+from academic_calendar import current_academic_session
 from config import settings
 from schemas.chat import UserContext
 
@@ -29,9 +30,7 @@ async def start_fee_reminder_workflow(
     session: str | None = None,
     className: str | None = None,
 ) -> dict:
-    from tools.attendance import current_academic_session  # local import avoids a module cycle
-
-    payload: dict = {"session": session or current_academic_session()}
+    payload: dict = {"session": session or await current_academic_session(access_token)}
     if className:
         payload["className"] = className
 

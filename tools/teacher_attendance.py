@@ -40,7 +40,7 @@ async def _fetch_class_attendance(
 
     params: dict = {"type": type}
     if type == "year":
-        params["session"] = session or current_academic_session()
+        params["session"] = session or await current_academic_session(access_token)
     elif type == "month":
         if month is None or year is None:
             return {"error": "month and year are required when type is 'month'"}
@@ -98,6 +98,66 @@ async def get_class_attendance_summary(
         "studentsBelow75Percent": sum(1 for p in percentages if p < 75),
         "lowestAttendance": [_slim(s) for s in by_pct_asc[:3]],
         "highestAttendance": [_slim(s) for s in by_pct_asc[-3:][::-1]],
+    }
+
+
+async def get_consecutively_absent_students(
+    user: UserContext,
+    access_token: str,
+    minDays: int = 3,
+    session: str | None = None,
+) -> dict:
+    """Students in the teacher's class absent for the last `minDays` school days running.
+
+    A different question from get_low_attendance_students, not a variant of it: this finds a
+    *recent pattern* ("who has stopped showing up this week"), while that one finds a *cumulative
+    shortfall* ("who is below 75% for the year"). The two routinely return different students —
+    someone absent three days straight can still be well above threshold — so they are kept as
+    separate tools rather than one with a mode flag, which also gives the model two unambiguous
+    descriptions to route between.
+    """
+    class_name = user.className
+    if not class_name:
+        return {"error": "You are not assigned as a class teacher, so class-wide attendance isn't available to you."}
+
+    params: dict = {"minDays": minDays, "session": session or await current_academic_session(access_token)}
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{settings.spring_boot_url}/api/attendance/consecutive-absentees/class/{class_name}",
+            params=params,
+            cookies={"accessToken": access_token},
+            timeout=10.0,
+        )
+
+    if response.status_code == 403:
+        return {"error": "Access denied. You can only view attendance for your assigned class."}
+    if response.status_code != 200:
+        return {"error": f"Spring Boot returned {response.status_code}: {response.text}"}
+
+    raw = response.json()
+    if not raw:
+        return {
+            "className": class_name,
+            "minConsecutiveDays": minDays,
+            "studentsFound": 0,
+            "message": f"No students have been absent for {minDays} or more consecutive school days.",
+        }
+
+    return {
+        "className": class_name,
+        "minConsecutiveDays": minDays,
+        "studentsFound": len(raw),
+        "students": [
+            {
+                "studentId": s["studentId"],
+                "studentName": s["studentName"],
+                "consecutiveAbsentDays": s["consecutiveAbsentDays"],
+                "absentDates": s["absentDates"],
+                "attendancePercentage": round(s.get("attendancePercentage", 0.0), 1),
+            }
+            for s in raw
+        ],
     }
 
 

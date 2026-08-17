@@ -27,7 +27,7 @@ async def get_fee_defaulters(
     session: str | None = None,
     className: str | None = None,
 ) -> dict:
-    resolved_session = session or current_academic_session()
+    resolved_session = session or await current_academic_session(access_token)
 
     params: dict = {"session": resolved_session}
     if className:

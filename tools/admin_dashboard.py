@@ -91,7 +91,7 @@ async def get_class_attendance_comparison(
     if type != "year":
         return {"error": f"Unknown type '{type}'. Use 'year' or 'month'."}
 
-    resolved_session = session or current_academic_session()
+    resolved_session = session or await current_academic_session(access_token)
 
     async with httpx.AsyncClient() as client:
         response = await client.get(

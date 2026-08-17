@@ -21,7 +21,7 @@ async def get_school_low_attendance_students(
     threshold: float = 75.0,
     session: str | None = None,
 ) -> dict:
-    resolved_session = session or current_academic_session()
+    resolved_session = session or await current_academic_session(access_token)
 
     async with httpx.AsyncClient() as client:
         response = await client.get(

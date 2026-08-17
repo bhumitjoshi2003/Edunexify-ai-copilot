@@ -42,7 +42,7 @@ async def get_class_exam_results(
     examName: str | None = None,
 ) -> dict:
     """Per-student breakdown for one named class's exam — top/lowest scorer, full ranked list."""
-    resolved_session = session or current_academic_session()
+    resolved_session = session or await current_academic_session(access_token)
 
     params: dict = {"session": resolved_session}
     if examName:
@@ -92,7 +92,7 @@ async def get_school_performance_summary(
     access_token: str,
     session: str | None = None,
 ) -> dict:
-    resolved_session = session or current_academic_session()
+    resolved_session = session or await current_academic_session(access_token)
 
     async with httpx.AsyncClient() as client:
         response = await client.get(

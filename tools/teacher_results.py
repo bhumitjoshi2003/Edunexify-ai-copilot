@@ -18,7 +18,7 @@ import httpx
 
 from config import settings
 from schemas.chat import UserContext
-from tools.fees import current_academic_session
+from academic_calendar import current_academic_session
 
 
 async def get_class_performance_summary(
@@ -31,7 +31,7 @@ async def get_class_performance_summary(
     if not class_name:
         return {"error": "You are not assigned as a class teacher, so class performance data isn't available to you."}
 
-    resolved_session = session or current_academic_session()
+    resolved_session = session or await current_academic_session(access_token)
 
     params: dict = {"session": resolved_session}
     if examName:
