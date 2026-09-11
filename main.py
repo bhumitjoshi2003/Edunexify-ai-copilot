@@ -10,6 +10,7 @@ import checkpointer
 import memory
 from routers import (
     chat,
+    wisdom,
     knowledge_base,
     workflows_attendance_reminders,
     workflows_fee_reminders,
@@ -27,6 +28,7 @@ app = FastAPI(
 )
 
 app.include_router(chat.router)
+app.include_router(wisdom.router)
 app.include_router(knowledge_base.router)
 app.include_router(workflows_fee_reminders.router)
 app.include_router(workflows_attendance_reminders.router)
