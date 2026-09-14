@@ -24,6 +24,7 @@ from config import settings
 from tracing import Trace, summarize_tool_result
 from schemas.chat import ChatRequest, ChatResponse, UserContext
 from academic_calendar import current_academic_session
+from observability import capture_unexpected
 from tools.attendance import get_attendance_summary
 from tools.fees import get_fee_summary
 from tools.results import get_results_summary
@@ -1604,6 +1605,8 @@ async def chat(
                 break
 
     except APIStatusError as e:
+        if e.status_code >= 500 or e.status_code == 402:
+            capture_unexpected("ai.provider", e)
         trace.errored = True
         trace.error_message = f"APIStatusError({e.status_code})"
         trace.final_reply = ""
@@ -1812,6 +1815,8 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
             break  # finish_reason == "stop" (or unexpected) — done
 
     except APIStatusError as e:
+        if e.status_code >= 500 or e.status_code == 402:
+            capture_unexpected("ai.provider.stream", e)
         errored = True
         trace.error_message = f"APIStatusError({e.status_code})"
         if e.status_code == 402 or e.status_code == 429:
@@ -1821,6 +1826,7 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
         full_reply += msg
         yield msg
     except Exception as e:
+        capture_unexpected("ai.stream", e)
         errored = True
         trace.error_message = str(e)
         msg = "\n\n⚠️ AI Copilot is temporarily unavailable. Please try again later."

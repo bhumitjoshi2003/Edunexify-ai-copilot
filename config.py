@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     # Optional — sensible defaults for local development
     spring_boot_url: str = "http://localhost:8080"
 
+    # Error-only monitoring. An empty DSN disables Sentry completely.
+    sentry_dsn: str = ""
+    sentry_environment: str = "production"
+    release_sha: str = ""
+
     # Conversation memory (Redis)
     redis_url: str = "redis://localhost:6379/0"
     conversation_ttl_seconds: int = 1800       # sliding TTL — refreshed on every turn

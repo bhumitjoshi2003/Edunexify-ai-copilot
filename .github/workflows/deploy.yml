@@ -116,6 +116,9 @@ jobs:
                 -e SPRING_BOOT_URL='${{ secrets.SPRING_BOOT_URL }}' \
                 -e REDIS_URL='${{ secrets.REDIS_URL }}' \
                 -e OPENAI_API_KEY='${{ secrets.OPENAI_API_KEY }}' \
+                -e SENTRY_DSN='${{ secrets.SENTRY_DSN }}' \
+                -e SENTRY_ENVIRONMENT=production \
+                -e RELEASE_SHA='${{ github.sha }}' \
                 "$1"
             }
 
