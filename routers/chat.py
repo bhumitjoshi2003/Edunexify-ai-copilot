@@ -1514,6 +1514,8 @@ async def chat(
 ) -> ChatResponse:
     if x_internal_secret != settings.internal_secret:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if len(request.message) > settings.max_message_chars:
+        raise HTTPException(status_code=413, detail="Message too long.")
 
     # Short-term memory: prior turns for this schoolId+userId+conversationId,
     # oldest first, already trimmed to the last N messages by memory.py.
@@ -1554,7 +1556,8 @@ async def chat(
             # data, not creative writing, and a lower temperature measurably reduces
             # the model embellishing retrieved text with plausible-sounding but
             # unsupported specifics (see the Knowledge Base grounding fixes).
-            completion_kwargs: dict = {"model": "deepseek-chat", "messages": messages, "temperature": 0.3}
+            completion_kwargs: dict = {"model": "deepseek-chat", "messages": messages, "temperature": 0.3,
+                                         "max_tokens": settings.max_output_tokens}
             if role_tools:
                 completion_kwargs["tools"] = role_tools
                 completion_kwargs["tool_choice"] = "auto"
@@ -1693,6 +1696,7 @@ async def _stream_chat_response(request: ChatRequest, http_request: Request) -> 
         for _ in range(5):  # Safety cap — prevents infinite loops, same as /chat
             completion_kwargs: dict = {
                 "model": "deepseek-chat", "messages": messages, "stream": True, "temperature": 0.3,
+                "max_tokens": settings.max_output_tokens,
                 "stream_options": {"include_usage": True},
             }
             if role_tools:
@@ -1886,5 +1890,7 @@ async def chat_stream(
 ) -> StreamingResponse:
     if x_internal_secret != settings.internal_secret:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if len(request.message) > settings.max_message_chars:
+        raise HTTPException(status_code=413, detail="Message too long.")
 
     return StreamingResponse(_stream_chat_response(request, http_request), media_type="text/plain; charset=utf-8")
