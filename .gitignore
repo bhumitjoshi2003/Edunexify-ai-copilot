@@ -5,3 +5,15 @@ __pycache__/
 venv/
 .venv/
 evals/results/
+
+# Credentials never belong in the repository (OPS-2)
+*.pem
+*.p12
+*.jks
+*.keystore
+*firebase-adminsdk*.json
+*service-account*.json
+.env
+.env.*
+!.env.example
+!.env.eval.example

@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     embedding_model: str = "text-embedding-3-small"
 
+    # Cost controls (AI-1). Every chat completion is capped at max_output_tokens (never the
+    # provider default), and a message longer than max_message_chars is refused before any model
+    # call — Spring enforces the same limit first; this is the service's own backstop.
+    max_output_tokens: int = 800
+    max_message_chars: int = 4000
+
     # Optional — sensible defaults for local development
     spring_boot_url: str = "http://localhost:8080"
 
